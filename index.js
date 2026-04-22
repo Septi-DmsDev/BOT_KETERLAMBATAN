@@ -17,6 +17,27 @@ const DEFAULT_LATENESS_REPORT_OPTIONS = {
   incompleteMarkers: ['❌', '✘', '✖'],
   subsectionMarkers: ['CUSTOM', 'READY STOK', 'READY STOCK']
 };
+const MOJIBAKE_SYMBOL_MAP = {
+  'âœ…': '✅',
+  'â˜‘ï¸': '☑️',
+  'âœ”ï¸': '✔️',
+  'âœ”': '✔',
+  'âŒ': '❌',
+  'âœ˜': '✘',
+  'âœ–': '✖',
+  'ðŸ“Š': '📊',
+  'ðŸ“‹': '📋',
+  'ðŸ†”': '🆔',
+  'ðŸ•’': '🕒',
+  'ðŸ“Œ': '📌',
+  'ðŸ—‚ï¸': '🗂️',
+  'ðŸ”': '🔁',
+  'ðŸ”•': '🔕',
+  'ðŸ“': '📝',
+  'âš ï¸': '⚠️',
+  'âœ…': '✅',
+  'âŒ': '❌'
+};
 let watchdogTimer = null;
 let dailySummaryTimer = null;
 let retryQueueTimer = null;
@@ -480,6 +501,46 @@ function buildWebhookPayload(parsed, rules) {
   };
 }
 
+async function sendLatenessReportToWebhook(parsedReport, context, rules) {
+  const config = rules.latenessReport || {};
+  if (config.sendStructuredToSheet === false) return null;
+
+  const payload = buildLatenessStructuredPayload(parsedReport, context);
+  const res = await fetch(rules.webhook, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      action: 'appendLatenessReport',
+      token: rules.token,
+      spreadsheetId: rules.spreadsheetId,
+      summarySheetName: config.summarySheetName || 'BOT_LATENESS_SUMMARY',
+      itemSheetName: config.itemSheetName || 'BOT_LATENESS_ITEMS',
+      summary: payload.summary,
+      items: payload.items
+    })
+  });
+
+  const raw = await res.text();
+  let data = null;
+
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    data = null;
+  }
+
+  if (!res.ok || !data || data.success === false) {
+    throw createWebhookError(summarizeWebhookError((data && data.message) || raw, res.status), {
+      statusCode: res.status,
+      retryable: false,
+      kind: 'lateness_report',
+      raw
+    });
+  }
+
+  return data;
+}
+
 async function sendTextMessage(sock, jid, text, options = {}) {
   if (!sock || !jid || !text) return false;
 
@@ -654,12 +715,19 @@ function isHeaderLine(text = '') {
 
 function normalizeReportSpaces(text = '') {
   return String(text || '')
+    .replace(/âœ…|â˜‘ï¸|âœ”ï¸|âœ”|âŒ|âœ˜|âœ–|ðŸ“Š|ðŸ“‹|ðŸ†”|ðŸ•’|ðŸ“Œ|ðŸ—‚ï¸|ðŸ”|ðŸ”•|ðŸ“|âš ï¸/g, match => MOJIBAKE_SYMBOL_MAP[match] || match)
     .replace(/[\u0000-\u001f]+/g, ' ')
     .replace(/[\u200B-\u200D\uFEFF]/g, ' ')
     .replace(/\u00A0/g, ' ')
     .replace(/\t+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function normalizeMarkerList(markers = []) {
+  return (markers || [])
+    .map(marker => normalizeReportSpaces(marker))
+    .filter(Boolean);
 }
 
 function cleanReportLine(text = '') {
@@ -677,10 +745,10 @@ function normalizeStoreName(raw = '') {
 }
 
 function parseStoreHeaderLine(text = '') {
-  const cleaned = cleanReportLine(text);
+  const cleaned = cleanReportLine(text).replace(/[:\-]+$/, '');
   if (!cleaned) return null;
 
-  const match = cleaned.match(/^(shopee\s+.+?)\s+(keterlambatan|ketelambatan)\s+(\d+)$/i);
+  const match = cleaned.match(/^(shopee(?:\s+mall)?\s+.+?)\s+(keterlambatan|ketelambatan)\s+(\d+)\s*$/i);
   if (!match) return null;
 
   return {
@@ -694,7 +762,7 @@ function parseStoreHeaderLine(text = '') {
 
 function parseAgingHeaderLine(text = '') {
   const cleaned = cleanReportLine(text).replace(/[:\-]+$/, '');
-  const match = cleaned.match(/^H\+(\d+)$/i);
+  const match = cleaned.match(/^H\s*\+\s*(\d+)$/i);
   if (!match) return null;
 
   return {
@@ -748,7 +816,7 @@ function classifyLatenessEntryType(content = '') {
 }
 
 function extractLatenessStatus(content = '', options = DEFAULT_LATENESS_REPORT_OPTIONS) {
-  const source = String(content || '');
+  const source = normalizeReportSpaces(content);
   const completedMarkers = options.completedMarkers || DEFAULT_LATENESS_REPORT_OPTIONS.completedMarkers;
   const incompleteMarkers = options.incompleteMarkers || DEFAULT_LATENESS_REPORT_OPTIONS.incompleteMarkers;
 
@@ -793,11 +861,11 @@ function createLatenessStoreBucket(header) {
 function getLatenessReportOptions(rules = {}) {
   return {
     completedMarkers: Array.isArray(rules.completedMarkers) && rules.completedMarkers.length
-      ? rules.completedMarkers
-      : DEFAULT_LATENESS_REPORT_OPTIONS.completedMarkers,
+      ? normalizeMarkerList(rules.completedMarkers)
+      : normalizeMarkerList(DEFAULT_LATENESS_REPORT_OPTIONS.completedMarkers),
     incompleteMarkers: Array.isArray(rules.incompleteMarkers) && rules.incompleteMarkers.length
-      ? rules.incompleteMarkers
-      : DEFAULT_LATENESS_REPORT_OPTIONS.incompleteMarkers,
+      ? normalizeMarkerList(rules.incompleteMarkers)
+      : normalizeMarkerList(DEFAULT_LATENESS_REPORT_OPTIONS.incompleteMarkers),
     subsectionMarkers: Array.isArray(rules.latenessSubsectionMarkers) && rules.latenessSubsectionMarkers.length
       ? rules.latenessSubsectionMarkers.map(item => normalizeReportSpaces(item).toUpperCase())
       : DEFAULT_LATENESS_REPORT_OPTIONS.subsectionMarkers
@@ -966,6 +1034,49 @@ function isLikelyLatenessReportText(text = '', rules = {}) {
   return parsed.stores.length > 0 && parsed.totals.items > 0;
 }
 
+function buildLatenessStructuredPayload(parsed, context = {}) {
+  const now = getTimestamp();
+  const summary = {
+    at: now,
+    group_name: context.groupName || '',
+    sender: context.sender || '',
+    message_id: context.messageId || '',
+    store_count: parsed.totals.stores,
+    header_total: parsed.totals.headerTotal,
+    item_total: parsed.totals.items,
+    completed_total: parsed.totals.status.completed,
+    incomplete_total: parsed.totals.status.incomplete,
+    mixed_total: parsed.totals.status.mixed,
+    unknown_total: parsed.totals.status.unknown,
+    aging_summary: buildCompactAgingSummary(parsed.totals.aging),
+    findings: JSON.stringify(parsed.formatFindings || [])
+  };
+
+  const items = [];
+  for (const store of parsed.stores) {
+    for (const item of store.items) {
+      items.push({
+        at: now,
+        group_name: context.groupName || '',
+        sender: context.sender || '',
+        message_id: context.messageId || '',
+        store_label: store.header.storeLabel || '',
+        store_header_total: store.header.totalInHeader || 0,
+        item_no: item.itemNo || 0,
+        aging: item.aging || '',
+        subsection: item.subsection || '',
+        type: item.type || '',
+        status: item.status?.label || 'unknown',
+        line_number: item.lineNumber || 0,
+        content: item.content || '',
+        raw: item.raw || ''
+      });
+    }
+  }
+
+  return { summary, items };
+}
+
 function buildCompactAgingSummary(agingCounts = {}) {
   const entries = Object.entries(agingCounts || {})
     .sort((a, b) => {
@@ -1031,6 +1142,56 @@ function buildLatenessSummaryMessage(parsed, options = {}) {
 
 function normalizeTokenText(token = '') {
   return String(token).replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9]+$/g, '');
+}
+
+function buildLatenessSummaryMessage(parsed, options = {}) {
+  const storeLimit = Math.max(1, Number(options.storeLimit || 12));
+  const lines = [];
+
+  lines.push('📊 *REKAP LAPORAN KETERLAMBATAN*');
+  lines.push(`Toko: ${parsed.totals.stores} | Header: ${parsed.totals.headerTotal} | Item: ${parsed.totals.items}`);
+  lines.push(`Aging: ${buildCompactAgingSummary(parsed.totals.aging)}`);
+  lines.push(`Status: ✅ ${parsed.totals.status.completed} | ❌ ${parsed.totals.status.incomplete} | ? ${parsed.totals.status.unknown} | mix ${parsed.totals.status.mixed}`);
+  lines.push('');
+  lines.push('*Per toko:*');
+
+  parsed.stores.slice(0, storeLimit).forEach(store => {
+    const mismatchTag = store.mismatchWithHeader === 0
+      ? ''
+      : ` | selisih ${store.mismatchWithHeader > 0 ? '+' : ''}${store.mismatchWithHeader}`;
+    const agingSummary = buildCompactAgingSummary(store.agingCounts);
+    const statusSummary = `✅${store.statusCounts.completed} ❌${store.statusCounts.incomplete} ?${store.statusCounts.unknown}`;
+    lines.push(`- ${store.header.storeLabel}: ${store.itemCount}/${store.header.totalInHeader}${mismatchTag}`);
+    lines.push(`  ${agingSummary} | ${statusSummary}`);
+  });
+
+  if (parsed.stores.length > storeLimit) {
+    lines.push(`...dan ${parsed.stores.length - storeLimit} toko lainnya`);
+  }
+
+  const notes = [];
+  const mismatchStores = parsed.stores.filter(store => store.mismatchWithHeader !== 0);
+  if (mismatchStores.length) {
+    notes.push(`Mismatch header/item: ${mismatchStores.map(store => `${store.header.storeLabel} ${store.header.totalInHeader}->${store.itemCount}`).join(', ')}`);
+  }
+
+  const noHPlusStores = parsed.stores.filter(store => store.agingCounts.NO_H_PLUS);
+  if (noHPlusStores.length) {
+    notes.push(`Tanpa bucket H+: ${noHPlusStores.map(store => store.header.storeLabel).join(', ')}`);
+  }
+
+  const typoStores = parsed.stores.filter(store => store.header.typoVariant);
+  if (typoStores.length) {
+    notes.push(`Typo header: ${typoStores.map(store => store.header.storeLabel).join(', ')}`);
+  }
+
+  if (notes.length) {
+    lines.push('');
+    lines.push('*Temuan format:*');
+    notes.forEach(note => lines.push(`- ${note}`));
+  }
+
+  return lines.join('\n').trim();
 }
 
 function isLikelyTrackingToken(token = '') {
@@ -2113,14 +2274,19 @@ async function connectToWhatsApp() {
     if (isLikelyLatenessReportText(text, rules)) {
       const parsedReport = parseLatenessReport(text, rules);
       const summaryMessage = buildLatenessSummaryMessage(parsedReport);
+      const latenessContext = {
+        groupName,
+        sender: msg.pushName || msg.key.participant || from,
+        messageId: msg.key?.id || ''
+      };
 
       const reportRecord = createLogRecord(
         'LATENESS_REPORT',
         `stores=${parsedReport.totals.stores}, items=${parsedReport.totals.items}, incomplete=${parsedReport.totals.status.incomplete}`,
         {
-          groupName,
-          sender: msg.pushName || msg.key.participant || from,
-          messageId: msg.key?.id || '',
+          groupName: latenessContext.groupName,
+          sender: latenessContext.sender,
+          messageId: latenessContext.messageId,
           line: '[message lateness report]',
           cleanedLine: summaryMessage
         },
@@ -2138,6 +2304,11 @@ async function connectToWhatsApp() {
       );
 
       await writeAndSendLog(reportRecord, rules);
+      try {
+        await sendLatenessReportToWebhook(parsedReport, latenessContext, rules);
+      } catch (error) {
+        console.error('⚠️ Gagal kirim lateness report ke sheet:', error.message);
+      }
       await safeReact(sock, from, msg.key, '📊');
       return reply(summaryMessage);
     }

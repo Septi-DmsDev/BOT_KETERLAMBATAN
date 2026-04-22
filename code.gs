@@ -24,6 +24,10 @@ function doPost(e) {
       return handleAppendData(body);
     }
 
+    if (body.action === 'appendLatenessReport') {
+      return handleAppendLatenessReport(body);
+    }
+
     return jsonResponse({
       success: false,
       message: 'Action tidak dikenal'
@@ -110,6 +114,36 @@ function handleAppendLog(body) {
   });
 }
 
+function handleAppendLatenessReport(body) {
+  if (!body.spreadsheetId) {
+    throw new Error('spreadsheetId kosong untuk lateness report');
+  }
+
+  if (!body.summary) {
+    throw new Error('summary lateness report kosong');
+  }
+
+  const ss = SpreadsheetApp.openById(body.spreadsheetId);
+  const summarySheet = getOrCreateLatenessSummarySheet(ss, body.summarySheetName || 'BOT_LATENESS_SUMMARY');
+  const itemSheet = getOrCreateLatenessItemSheet(ss, body.itemSheetName || 'BOT_LATENESS_ITEMS');
+
+  summarySheet.appendRow(buildLatenessSummaryRow(body.summary));
+
+  const items = Array.isArray(body.items) ? body.items : [];
+  if (items.length) {
+    const rows = items.map(buildLatenessItemRow);
+    itemSheet.getRange(itemSheet.getLastRow() + 1, 1, rows.length, rows[0].length).setValues(rows);
+  }
+
+  return jsonResponse({
+    success: true,
+    message: 'Lateness report berhasil ditambahkan',
+    summarySheet: summarySheet.getName(),
+    itemSheet: itemSheet.getName(),
+    itemCount: items.length
+  });
+}
+
 function getOrCreateLogSheet(ss, sheetName) {
   let sheet = ss.getSheetByName(sheetName);
 
@@ -129,6 +163,56 @@ function getOrCreateLogSheet(ss, sheetName) {
       'PJ_DIVISI',
       'MATCHED_TRIGGER',
       'CONFIDENCE'
+    ]]);
+  }
+
+  return sheet;
+}
+
+function getOrCreateLatenessSummarySheet(ss, sheetName) {
+  let sheet = ss.getSheetByName(sheetName);
+
+  if (!sheet) {
+    sheet = ss.insertSheet(sheetName);
+    sheet.getRange(1, 1, 1, 13).setValues([[
+      'AT',
+      'GROUP_NAME',
+      'SENDER',
+      'MESSAGE_ID',
+      'STORE_COUNT',
+      'HEADER_TOTAL',
+      'ITEM_TOTAL',
+      'COMPLETED_TOTAL',
+      'INCOMPLETE_TOTAL',
+      'MIXED_TOTAL',
+      'UNKNOWN_TOTAL',
+      'AGING_SUMMARY',
+      'FINDINGS'
+    ]]);
+  }
+
+  return sheet;
+}
+
+function getOrCreateLatenessItemSheet(ss, sheetName) {
+  let sheet = ss.getSheetByName(sheetName);
+
+  if (!sheet) {
+    sheet = ss.insertSheet(sheetName);
+    sheet.getRange(1, 1, 1, 13).setValues([[
+      'AT',
+      'GROUP_NAME',
+      'SENDER',
+      'MESSAGE_ID',
+      'STORE_LABEL',
+      'STORE_HEADER_TOTAL',
+      'ITEM_NO',
+      'AGING',
+      'SUBSECTION',
+      'TYPE',
+      'STATUS',
+      'LINE_NUMBER',
+      'CONTENT'
     ]]);
   }
 
@@ -163,6 +247,42 @@ function buildLogRow(record) {
     record.pj_divisi || '',
     record.matched_trigger || '',
     record.confidence || 0
+  ];
+}
+
+function buildLatenessSummaryRow(summary) {
+  return [
+    summary.at || '',
+    summary.group_name || '',
+    summary.sender || '',
+    summary.message_id || '',
+    summary.store_count || 0,
+    summary.header_total || 0,
+    summary.item_total || 0,
+    summary.completed_total || 0,
+    summary.incomplete_total || 0,
+    summary.mixed_total || 0,
+    summary.unknown_total || 0,
+    summary.aging_summary || '',
+    summary.findings || ''
+  ];
+}
+
+function buildLatenessItemRow(item) {
+  return [
+    item.at || '',
+    item.group_name || '',
+    item.sender || '',
+    item.message_id || '',
+    item.store_label || '',
+    item.store_header_total || 0,
+    item.item_no || 0,
+    item.aging || '',
+    item.subsection || '',
+    item.type || '',
+    item.status || '',
+    item.line_number || 0,
+    item.content || ''
   ];
 }
 

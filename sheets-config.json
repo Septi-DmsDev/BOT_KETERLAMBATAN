@@ -37,6 +37,11 @@
       "recentGroupWindowMs": 604800000,
       "targetGroupJids": []
     },
+    "latenessReport": {
+      "sendStructuredToSheet": true,
+      "summarySheetName": "BOT_LATENESS_SUMMARY",
+      "itemSheetName": "BOT_LATENESS_ITEMS"
+    },
     "notifications": {
       "operationalGroupMode": "silent",
       "sendErrorLogToReportGroup": true,
