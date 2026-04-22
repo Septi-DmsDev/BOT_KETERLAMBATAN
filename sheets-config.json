@@ -1,8 +1,8 @@
 {
   "operasional": {
-    "webhook": "https://script.google.com/macros/s/AKfycbwq-aI-hbp-yFf18X9pnUwyQa56k7wGT_FOPUUQ7k94Trvo0v2uOvqppgv8vrgv3WHq8A/exec",
+    "webhook": "https://script.google.com/macros/s/YOURSHEETIDWEBHOOK/exec",
     "token": "ganti-token-rahasia-kamu",
-    "spreadsheetId": "1kCTJTxXjAi1vOCzUM8mQCQ5XsqNvDujyTTeSojVNJYc",
+    "spreadsheetId": "YOURSHEETID",
     "timeZone": "Asia/Jakarta",
     "sheetName": "April 2026",
     "sheetMode": "monthly",
