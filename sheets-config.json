@@ -1,0 +1,95 @@
+{
+  "operasional": {
+    "webhook": "https://script.google.com/macros/s/AKfycbwq-aI-hbp-yFf18X9pnUwyQa56k7wGT_FOPUUQ7k94Trvo0v2uOvqppgv8vrgv3WHq8A/exec",
+    "token": "ganti-token-rahasia-kamu",
+    "spreadsheetId": "1kCTJTxXjAi1vOCzUM8mQCQ5XsqNvDujyTTeSojVNJYc",
+    "timeZone": "Asia/Jakarta",
+    "sheetName": "April 2026",
+    "sheetMode": "monthly",
+    "autoCreateMonthlySheet": true,
+    "monthlySheetTemplateName": "",
+    "logSuccessSheetName": "BOT_SUCCESS_LOG",
+    "logErrorSheetName": "BOT_ERROR_LOG",
+    "groupKeywords": [
+      "apo operasional",
+      "apo packing",
+      "keterlambatan",
+      "apo printing",
+      "apo finishing"
+    ],
+    "replyOnError": true,
+    "enableLocalLog": true,
+    "sendLogsToSheet": false,
+    "ignoreCompletedLateness": true,
+    "completedMarkers": ["✅", "☑️", "✔️", "✔"],
+    "incompleteMarkers": ["❌", "✘", "✖"],
+    "latenessSubsectionMarkers": ["CUSTOM", "READY STOK", "READY STOCK"],
+    "localLogFile": "./logs/parser-log.jsonl",
+    "stateFile": "./logs/bot-state.json",
+    "dedupWindowMs": 86400000,
+    "retryDelayMs": 300000,
+    "retryWorkerIntervalMs": 60000,
+    "retryMaxAttempts": 5,
+    "dailySummary": {
+      "enabled": true,
+      "time": "16:30",
+      "sendToKnownGroups": true,
+      "recentGroupWindowMs": 604800000,
+      "targetGroupJids": []
+    },
+    "notifications": {
+      "operationalGroupMode": "silent",
+      "sendErrorLogToReportGroup": true,
+      "reportGroupJid": "",
+      "sendParseErrorToPrivate": true
+    },
+    "minConfidence": 55,
+    "columns": {
+      "tanggal": 3,
+      "kode_job_resi": 4,
+      "ready_stock": 5,
+      "produk": 6,
+      "pj_divisi": 7,
+      "banding": 8
+    },
+    "divisionTriggers": {
+      "SMB": ["job masuk", "dm", "cs"],
+      "Creative": ["desain", "acc pertama", "acc per"],
+      "Printing": ["printing", "print", "prt", "pr"],
+      "Finishing": ["checker", "cheker", "potong", "ptng", "packing", "pack", "pkg", "fn", "cp", "ck", "pt"]
+    },
+    "shippingAnchors": [
+      "hemat kargo",
+      "sentral cargo",
+      "jnt cargo",
+      "spx standard",
+      "spx hemat",
+      "reguler",
+      "regular",
+      "cashless",
+      "standard",
+      "spx",
+      "jnt",
+      "jne",
+      "sicepat",
+      "anteraja",
+      "kargo",
+      "cargo",
+      "hemat"
+    ],
+    "examples": {
+      "custom": [
+        "SC 14326 N****h (nursyamsiah028) Kasih Lite 06 Hemat Kargo-Sentral Cargo 250 260409BDFCHQHG / pack 16",
+        "IP 164 ABIELINDA LUXURY LITE 38 SPX 200 2CCT / PACKING ALVIN [16/04/ 21.43]",
+        "KI 1320 MUHAMMAD FAJAR RIZQI BW GLOSSY A17 SPX 450 CY36 / packing 16",
+        "SS 654 M FATCHUROZI GLOSSY BW THREFOLD 16 JNT CARGO 250 15V2 / pack16",
+        "DP 204 ELLY KARTIKA LUXURY LITE 37 SPX 800 KT27 / DESAIN FIX 12/04"
+      ],
+      "ready": [
+        "260416035XPSVS tarif kode mix order 16 / pack 16",
+        "260416W0S8JC17 packaging hampers / printing",
+        "60415UVY62PYQ packaging hampers / desain"
+      ]
+    }
+  }
+}
