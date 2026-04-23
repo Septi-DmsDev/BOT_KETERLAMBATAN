@@ -111,6 +111,10 @@ function getSummaryConfig(rules = {}) {
   return rules.dailySummary || {};
 }
 
+function getLatenessSummaryConfig(rules = {}) {
+  return rules.latenessSummary || {};
+}
+
 function getNotificationConfig(rules = {}) {
   return rules.notifications || {};
 }
@@ -182,6 +186,12 @@ function createInitialRuntimeState() {
     dailyStats: {},
     summary: {
       lastSentByDate: {}
+    },
+    latenessReports: {
+      stores: {}
+    },
+    latenessSummary: {
+      lastSentTimeByDate: {}
     }
   };
 }
@@ -204,9 +214,11 @@ function ensureDailyStatsEntry(state, dayKey) {
 function pruneRuntimeState(state, rules = {}) {
   const now = Date.now();
   const summaryConfig = getSummaryConfig(rules);
+  const latenessSummaryConfig = getLatenessSummaryConfig(rules);
   const keepDays = Math.max(7, Number(rules.summaryRetentionDays || 45));
   const keepMs = keepDays * 24 * 60 * 60 * 1000;
   const groupKeepMs = Math.max(keepMs, Number(summaryConfig.recentGroupWindowMs || 7 * 24 * 60 * 60 * 1000));
+  const latenessKeepMs = Math.max(12 * 60 * 60 * 1000, Number(latenessSummaryConfig.snapshotWindowMs || 72 * 60 * 60 * 1000));
   const queuedDedupKeys = new Set((state.retryQueue || []).map(item => item.dedupKey).filter(Boolean));
 
   for (const [dedupKey, entry] of Object.entries(state.dedup || {})) {
@@ -229,10 +241,23 @@ function pruneRuntimeState(state, rules = {}) {
     }
   }
 
+  for (const dayKey of Object.keys(state.latenessSummary?.lastSentTimeByDate || {})) {
+    if (dayKey < minAllowedDate) {
+      delete state.latenessSummary.lastSentTimeByDate[dayKey];
+    }
+  }
+
   for (const [jid, info] of Object.entries(state.knownGroups || {})) {
     const lastSeenAt = Date.parse(info?.lastSeenAt || 0);
     if (!lastSeenAt || now - lastSeenAt <= groupKeepMs) continue;
     delete state.knownGroups[jid];
+  }
+
+  for (const [storeKey, snapshot] of Object.entries(state.latenessReports?.stores || {})) {
+    const updatedAt = Date.parse(snapshot?.updatedAt || 0);
+    if (!updatedAt || now - updatedAt > latenessKeepMs) {
+      delete state.latenessReports.stores[storeKey];
+    }
   }
 }
 
@@ -258,6 +283,10 @@ function getRuntimeState(rules = {}) {
   runtimeStateCache.dailyStats = runtimeStateCache.dailyStats || {};
   runtimeStateCache.summary = runtimeStateCache.summary || { lastSentByDate: {} };
   runtimeStateCache.summary.lastSentByDate = runtimeStateCache.summary.lastSentByDate || {};
+  runtimeStateCache.latenessReports = runtimeStateCache.latenessReports || { stores: {} };
+  runtimeStateCache.latenessReports.stores = runtimeStateCache.latenessReports.stores || {};
+  runtimeStateCache.latenessSummary = runtimeStateCache.latenessSummary || { lastSentTimeByDate: {} };
+  runtimeStateCache.latenessSummary.lastSentTimeByDate = runtimeStateCache.latenessSummary.lastSentTimeByDate || {};
 
   pruneRuntimeState(runtimeStateCache, rules);
   return runtimeStateCache;
@@ -407,7 +436,7 @@ function buildParseErrorPrivateMessage(parseErrors = []) {
   if (!parseErrors.length) return '';
 
   return [
-    '⚠️ Ada baris yang belum bisa diproses oleh bot:',
+    '?? Ada baris yang belum bisa diproses oleh bot:',
     '',
     ...buildErrorPreviewLines(parseErrors, 8),
     parseErrors.length > 8 ? `...dan ${parseErrors.length - 8} baris lainnya` : '',
@@ -418,7 +447,7 @@ function buildParseErrorPrivateMessage(parseErrors = []) {
 
 function buildReportGroupMessage(context, parseErrors = [], webhookErrors = []) {
   const parts = [
-    '📋 Log Report Keterlambatan',
+    '?? Log Report Keterlambatan',
     `Grup: ${getDisplayName(context.groupName)}`,
     `Pengirim: ${getDisplayName(context.sender)}`,
     `Parse error: ${parseErrors.length}`,
@@ -490,6 +519,217 @@ async function maybeSendDailySummary(sock, rules) {
   if (successSendCount > 0) {
     updateRuntimeState(rules, currentState => {
       currentState.summary.lastSentByDate[dayKey] = new Date().toISOString();
+    });
+  }
+}
+
+function normalizeScheduleTimes(values = [], fallback = []) {
+  const source = Array.isArray(values) && values.length ? values : fallback;
+  const unique = Array.from(new Set(source.map(value => String(value || '').trim()).filter(Boolean)));
+  return unique
+    .filter(value => /^\d{1,2}:\d{2}$/.test(value))
+    .sort((a, b) => {
+      const aParts = parseTimeValue(a);
+      const bParts = parseTimeValue(b);
+      return (aParts.hour * 60 + aParts.minute) - (bParts.hour * 60 + bParts.minute);
+    });
+}
+
+function compareScheduleTimeKeys(left = '', right = '') {
+  const leftParts = parseTimeValue(left || '00:00');
+  const rightParts = parseTimeValue(right || '00:00');
+  return (leftParts.hour * 60 + leftParts.minute) - (rightParts.hour * 60 + rightParts.minute);
+}
+
+function getLatestDueScheduleTime(times = [], timeZone = BOT_TIMEZONE, date = new Date()) {
+  let latest = '';
+
+  for (const value of times) {
+    if (hasReachedScheduledTime(value, timeZone, date)) {
+      latest = value;
+    }
+  }
+
+  return latest;
+}
+
+function getLatenessSummaryTargetGroupJids(rules = {}) {
+  const config = getLatenessSummaryConfig(rules);
+  const explicitTargets = (config.targetGroupJids || []).filter(Boolean);
+  if (explicitTargets.length) return explicitTargets;
+
+  const notificationConfig = getNotificationConfig(rules);
+  if (config.useReportGroup !== false && notificationConfig.reportGroupJid) {
+    return [notificationConfig.reportGroupJid];
+  }
+
+  return [];
+}
+
+function buildLatenessStoreKey(storeLabel = '', context = {}) {
+  return [
+    normalizeKeyPart(context.groupJid || context.groupName || 'unknown-group'),
+    normalizeKeyPart(storeLabel || 'unknown-store')
+  ].join('|');
+}
+
+function rememberLatenessReportSnapshot(rules, parsedReport, context = {}) {
+  if (!parsedReport?.stores?.length) return;
+
+  updateRuntimeState(rules, state => {
+    state.latenessReports = state.latenessReports || { stores: {} };
+    state.latenessReports.stores = state.latenessReports.stores || {};
+
+    for (const store of parsedReport.stores) {
+      const storeKey = buildLatenessStoreKey(store.header?.storeLabel, context);
+      state.latenessReports.stores[storeKey] = {
+        key: storeKey,
+        storeLabel: store.header?.storeLabel || '',
+        headerTotal: Number(store.header?.totalInHeader || 0),
+        itemCount: Number(store.itemCount || 0),
+        mismatchWithHeader: Number(store.mismatchWithHeader || 0),
+        agingCounts: store.agingCounts || {},
+        statusCounts: store.statusCounts || {},
+        typoVariant: Boolean(store.header?.typoVariant),
+        groupJid: context.groupJid || '',
+        groupName: context.groupName || '',
+        sender: context.sender || '',
+        messageId: context.messageId || '',
+        updatedAt: new Date().toISOString()
+      };
+    }
+  });
+}
+
+function getActiveLatenessStoreSnapshots(rules = {}, date = new Date()) {
+  const config = getLatenessSummaryConfig(rules);
+  const snapshotWindowMs = Math.max(12 * 60 * 60 * 1000, Number(config.snapshotWindowMs || 72 * 60 * 60 * 1000));
+  const minUpdatedAt = date.getTime() - snapshotWindowMs;
+
+  return Object.values(getRuntimeState(rules).latenessReports?.stores || {})
+    .filter(snapshot => {
+      const updatedAt = Date.parse(snapshot?.updatedAt || 0);
+      return updatedAt && updatedAt >= minUpdatedAt;
+    })
+    .sort((a, b) => String(a.storeLabel || '').localeCompare(String(b.storeLabel || ''), 'id'));
+}
+
+function buildAggregatedLatenessReport(rules = {}, date = new Date()) {
+  const snapshots = getActiveLatenessStoreSnapshots(rules, date);
+  const aggregated = {
+    totals: {
+      stores: snapshots.length,
+      headerTotal: 0,
+      items: 0,
+      aging: {},
+      status: {
+        completed: 0,
+        incomplete: 0,
+        mixed: 0,
+        unknown: 0
+      }
+    },
+    stores: [],
+    formatFindings: []
+  };
+
+  for (const snapshot of snapshots) {
+    aggregated.totals.headerTotal += Number(snapshot.headerTotal || 0);
+    aggregated.totals.items += Number(snapshot.itemCount || 0);
+
+    for (const [aging, count] of Object.entries(snapshot.agingCounts || {})) {
+      aggregated.totals.aging[aging] = Number(aggregated.totals.aging[aging] || 0) + Number(count || 0);
+    }
+
+    for (const [statusKey, count] of Object.entries(snapshot.statusCounts || {})) {
+      aggregated.totals.status[statusKey] = Number(aggregated.totals.status[statusKey] || 0) + Number(count || 0);
+    }
+
+    aggregated.stores.push({
+      header: {
+        storeLabel: snapshot.storeLabel || '',
+        totalInHeader: Number(snapshot.headerTotal || 0),
+        typoVariant: Boolean(snapshot.typoVariant)
+      },
+      itemCount: Number(snapshot.itemCount || 0),
+      mismatchWithHeader: Number(snapshot.mismatchWithHeader || 0),
+      agingCounts: snapshot.agingCounts || {},
+      statusCounts: snapshot.statusCounts || {},
+      groupName: snapshot.groupName || '',
+      updatedAt: snapshot.updatedAt || ''
+    });
+  }
+
+  const mismatchStores = aggregated.stores.filter(store => store.mismatchWithHeader !== 0);
+  if (mismatchStores.length) {
+    aggregated.formatFindings.push({
+      code: 'HEADER_ITEM_MISMATCH',
+      count: mismatchStores.length
+    });
+  }
+
+  const noHPlusStores = aggregated.stores.filter(store => Number(store.agingCounts?.NO_H_PLUS || 0) > 0);
+  if (noHPlusStores.length) {
+    aggregated.formatFindings.push({
+      code: 'STORE_WITHOUT_H_PLUS_BLOCK',
+      count: noHPlusStores.length
+    });
+  }
+
+  const typoStores = aggregated.stores.filter(store => store.header.typoVariant);
+  if (typoStores.length) {
+    aggregated.formatFindings.push({
+      code: 'HEADER_TYPO_KETELAMBATAN',
+      count: typoStores.length
+    });
+  }
+
+  return aggregated;
+}
+
+async function maybeSendLatenessSummary(sock, rules, date = new Date()) {
+  const config = getLatenessSummaryConfig(rules);
+  if (config.enabled === false) return;
+  if (!sock) return;
+
+  const times = normalizeScheduleTimes(config.times, ['06:00', '16:30']);
+  if (!times.length) return;
+
+  const dueTime = getLatestDueScheduleTime(times, rules.timeZone || BOT_TIMEZONE, date);
+  if (!dueTime) return;
+
+  const dayKey = getDateKey(rules.timeZone || BOT_TIMEZONE, date);
+  const lastSentTime = String(getRuntimeState(rules).latenessSummary?.lastSentTimeByDate?.[dayKey] || '');
+  if (lastSentTime && compareScheduleTimeKeys(lastSentTime, dueTime) >= 0) return;
+
+  const targets = getLatenessSummaryTargetGroupJids(rules);
+  if (!targets.length) return;
+
+  const aggregated = buildAggregatedLatenessReport(rules, date);
+  if (!aggregated.stores.length && config.sendWhenEmpty === false) return;
+
+  const message = buildLatenessSummaryMessage(aggregated, {
+    storeLimit: Number(config.storeLimit || 20),
+    title: '📊 *REKAP LAPORAN KETERLAMBATAN*',
+    subtitle: `Jadwal: ${getDisplayDate(rules.timeZone || BOT_TIMEZONE, date)} ${dueTime} WIB`,
+    emptyMessage: 'Belum ada snapshot laporan keterlambatan aktif.'
+  });
+
+  let successSendCount = 0;
+  for (const jid of targets) {
+    try {
+      await sock.sendMessage(jid, { text: message });
+      successSendCount += 1;
+    } catch (error) {
+      console.error(`Gagal kirim rekap keterlambatan ke ${jid}:`, error.message);
+    }
+  }
+
+  if (successSendCount > 0) {
+    updateRuntimeState(rules, state => {
+      state.latenessSummary = state.latenessSummary || { lastSentTimeByDate: {} };
+      state.latenessSummary.lastSentTimeByDate = state.latenessSummary.lastSentTimeByDate || {};
+      state.latenessSummary.lastSentTimeByDate[dayKey] = dueTime;
     });
   }
 }
@@ -1080,6 +1320,12 @@ function buildLatenessStructuredPayload(parsed, context = {}) {
 function buildCompactAgingSummary(agingCounts = {}) {
   const entries = Object.entries(agingCounts || {})
     .sort((a, b) => {
+      const aIsNoBucket = a[0] === 'NO_H_PLUS';
+      const bIsNoBucket = b[0] === 'NO_H_PLUS';
+      if (aIsNoBucket !== bIsNoBucket) {
+        return aIsNoBucket ? 1 : -1;
+      }
+
       const aNum = Number(String(a[0]).replace(/\D+/g, ''));
       const bNum = Number(String(b[0]).replace(/\D+/g, ''));
       if (Number.isNaN(aNum) || Number.isNaN(bNum)) return a[0].localeCompare(b[0]);
@@ -1091,24 +1337,34 @@ function buildCompactAgingSummary(agingCounts = {}) {
 }
 
 function buildLatenessSummaryMessage(parsed, options = {}) {
+  const title = options.title || '📊 *REKAP LAPORAN KETERLAMBATAN*';
+  const subtitle = options.subtitle || '';
   const storeLimit = Math.max(1, Number(options.storeLimit || 12));
-  const lines = [];
+  const emptyMessage = options.emptyMessage || 'Belum ada data laporan keterlambatan.';
+  const lines = [title];
 
-  lines.push('📊 *REKAP LAPORAN KETERLAMBATAN*');
+  if (subtitle) {
+    lines.push(subtitle);
+  }
+
+  if (!parsed?.stores?.length) {
+    lines.push(emptyMessage);
+    return lines.join('\n').trim();
+  }
+
   lines.push(`Toko: ${parsed.totals.stores} | Header: ${parsed.totals.headerTotal} | Item: ${parsed.totals.items}`);
   lines.push(`Aging: ${buildCompactAgingSummary(parsed.totals.aging)}`);
   lines.push(`Status: ✅ ${parsed.totals.status.completed} | ❌ ${parsed.totals.status.incomplete} | ? ${parsed.totals.status.unknown} | mix ${parsed.totals.status.mixed}`);
   lines.push('');
   lines.push('*Per toko:*');
 
-  parsed.stores.slice(0, storeLimit).forEach(store => {
+  parsed.stores.slice(0, storeLimit).forEach((store, index) => {
     const mismatchTag = store.mismatchWithHeader === 0
       ? ''
       : ` | selisih ${store.mismatchWithHeader > 0 ? '+' : ''}${store.mismatchWithHeader}`;
     const agingSummary = buildCompactAgingSummary(store.agingCounts);
     const statusSummary = `✅${store.statusCounts.completed} ❌${store.statusCounts.incomplete} ?${store.statusCounts.unknown}`;
-    lines.push(`- ${store.header.storeLabel}: ${store.itemCount}/${store.header.totalInHeader}${mismatchTag}`);
-    lines.push(`  ${agingSummary} | ${statusSummary}`);
+    lines.push(`${index + 1}. ${store.header.storeLabel}: ${store.itemCount}/${store.header.totalInHeader}${mismatchTag} | ${agingSummary} | ${statusSummary}`);
   });
 
   if (parsed.stores.length > storeLimit) {
@@ -1121,7 +1377,7 @@ function buildLatenessSummaryMessage(parsed, options = {}) {
     notes.push(`Mismatch header/item: ${mismatchStores.map(store => `${store.header.storeLabel} ${store.header.totalInHeader}->${store.itemCount}`).join(', ')}`);
   }
 
-  const noHPlusStores = parsed.stores.filter(store => store.agingCounts.NO_H_PLUS);
+  const noHPlusStores = parsed.stores.filter(store => Number(store.agingCounts?.NO_H_PLUS || 0) > 0);
   if (noHPlusStores.length) {
     notes.push(`Tanpa bucket H+: ${noHPlusStores.map(store => store.header.storeLabel).join(', ')}`);
   }
@@ -1142,56 +1398,6 @@ function buildLatenessSummaryMessage(parsed, options = {}) {
 
 function normalizeTokenText(token = '') {
   return String(token).replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9]+$/g, '');
-}
-
-function buildLatenessSummaryMessage(parsed, options = {}) {
-  const storeLimit = Math.max(1, Number(options.storeLimit || 12));
-  const lines = [];
-
-  lines.push('📊 *REKAP LAPORAN KETERLAMBATAN*');
-  lines.push(`Toko: ${parsed.totals.stores} | Header: ${parsed.totals.headerTotal} | Item: ${parsed.totals.items}`);
-  lines.push(`Aging: ${buildCompactAgingSummary(parsed.totals.aging)}`);
-  lines.push(`Status: ✅ ${parsed.totals.status.completed} | ❌ ${parsed.totals.status.incomplete} | ? ${parsed.totals.status.unknown} | mix ${parsed.totals.status.mixed}`);
-  lines.push('');
-  lines.push('*Per toko:*');
-
-  parsed.stores.slice(0, storeLimit).forEach(store => {
-    const mismatchTag = store.mismatchWithHeader === 0
-      ? ''
-      : ` | selisih ${store.mismatchWithHeader > 0 ? '+' : ''}${store.mismatchWithHeader}`;
-    const agingSummary = buildCompactAgingSummary(store.agingCounts);
-    const statusSummary = `✅${store.statusCounts.completed} ❌${store.statusCounts.incomplete} ?${store.statusCounts.unknown}`;
-    lines.push(`- ${store.header.storeLabel}: ${store.itemCount}/${store.header.totalInHeader}${mismatchTag}`);
-    lines.push(`  ${agingSummary} | ${statusSummary}`);
-  });
-
-  if (parsed.stores.length > storeLimit) {
-    lines.push(`...dan ${parsed.stores.length - storeLimit} toko lainnya`);
-  }
-
-  const notes = [];
-  const mismatchStores = parsed.stores.filter(store => store.mismatchWithHeader !== 0);
-  if (mismatchStores.length) {
-    notes.push(`Mismatch header/item: ${mismatchStores.map(store => `${store.header.storeLabel} ${store.header.totalInHeader}->${store.itemCount}`).join(', ')}`);
-  }
-
-  const noHPlusStores = parsed.stores.filter(store => store.agingCounts.NO_H_PLUS);
-  if (noHPlusStores.length) {
-    notes.push(`Tanpa bucket H+: ${noHPlusStores.map(store => store.header.storeLabel).join(', ')}`);
-  }
-
-  const typoStores = parsed.stores.filter(store => store.header.typoVariant);
-  if (typoStores.length) {
-    notes.push(`Typo header: ${typoStores.map(store => store.header.storeLabel).join(', ')}`);
-  }
-
-  if (notes.length) {
-    lines.push('');
-    lines.push('*Temuan format:*');
-    notes.forEach(note => lines.push(`- ${note}`));
-  }
-
-  return lines.join('\n').trim();
 }
 
 function isLikelyTrackingToken(token = '') {
@@ -2123,7 +2329,10 @@ function startBackgroundWorkers(rules) {
   if (!dailySummaryTimer) {
     dailySummaryTimer = setInterval(() => {
       maybeSendDailySummary(activeSock, rules).catch(error => {
-        console.error('⚠️ Daily summary worker error:', error.message);
+        console.error('?????? Daily summary worker error:', error.message);
+      });
+      maybeSendLatenessSummary(activeSock, rules).catch(error => {
+        console.error('Lateness summary worker error:', error.message);
       });
     }, 60000);
   }
@@ -2133,7 +2342,11 @@ function startBackgroundWorkers(rules) {
   });
 
   maybeSendDailySummary(activeSock, rules).catch(error => {
-    console.error('⚠️ Daily summary worker error:', error.message);
+    console.error('?????? Daily summary worker error:', error.message);
+  });
+
+  maybeSendLatenessSummary(activeSock, rules).catch(error => {
+    console.error('Lateness summary worker error:', error.message);
   });
 }
 
@@ -2257,28 +2470,40 @@ async function connectToWhatsApp() {
     const notificationConfig = getNotificationConfig(rules);
 
     if (trimmed === '!ping') {
-      return reply('✅ Bot aktif.');
+      return reply('? Bot aktif.');
     }
 
     if (trimmed === '!status') {
       const reportGroupStatus = notificationConfig.reportGroupJid ? 'set' : 'belum diset';
+      const latenessTimes = normalizeScheduleTimes(getLatenessSummaryConfig(rules).times, ['06:00', '16:30']).join(', ');
       return reply(
-        `✅ Bot aktif.\n🕒 Server: ${getTimestamp()}\n📌 Mode: Operasional Parser\n🗂️ Sheet: ${getCurrentSheetName(rules)}\n🔁 Retry Queue: ${getRetryQueueLength(rules)}\n🔕 Grup operasional: ${notificationConfig.operationalGroupMode || 'reply'}\n📝 Report group: ${reportGroupStatus}`
+        `? Bot aktif.
+?? Server: ${getTimestamp()}
+?? Mode: Operasional Parser
+??? Sheet: ${getCurrentSheetName(rules)}
+?? Retry Queue: ${getRetryQueueLength(rules)}
+?? Grup operasional: ${notificationConfig.operationalGroupMode || 'reply'}
+?? Report group: ${reportGroupStatus}
+?? Rekap keterlambatan: ${latenessTimes} WIB`
       );
     }
 
     if (trimmed === '!groupid') {
-      return reply(`📌 Nama grup: ${groupName}\n🆔 JID: ${from}`);
+      return reply(`?? Nama grup: ${groupName}
+?? JID: ${from}`);
     }
 
     if (isLikelyLatenessReportText(text, rules)) {
       const parsedReport = parseLatenessReport(text, rules);
       const summaryMessage = buildLatenessSummaryMessage(parsedReport);
       const latenessContext = {
+        groupJid: from,
         groupName,
         sender: msg.pushName || msg.key.participant || from,
         messageId: msg.key?.id || ''
       };
+
+      rememberLatenessReportSnapshot(rules, parsedReport, latenessContext);
 
       const reportRecord = createLogRecord(
         'LATENESS_REPORT',
@@ -2307,10 +2532,9 @@ async function connectToWhatsApp() {
       try {
         await sendLatenessReportToWebhook(parsedReport, latenessContext, rules);
       } catch (error) {
-        console.error('⚠️ Gagal kirim lateness report ke sheet:', error.message);
+        console.error('Gagal kirim lateness report ke sheet:', error.message);
       }
-      await safeReact(sock, from, msg.key, '📊');
-      return reply(summaryMessage);
+      return;
     }
 
     const sender = msg.pushName || msg.key.participant || from;
@@ -2496,6 +2720,7 @@ if (require.main === module) {
 
 module.exports = {
   appConfig,
+  buildAggregatedLatenessReport,
   buildDailySummaryMessage,
   buildDedupKey,
   detectDivision,
@@ -2506,5 +2731,6 @@ module.exports = {
   parseLine,
   parseReadyLine,
   buildLatenessSummaryMessage,
+  rememberLatenessReportSnapshot,
   summarizeWebhookError
 };

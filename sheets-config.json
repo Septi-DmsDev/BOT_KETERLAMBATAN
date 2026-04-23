@@ -21,9 +21,22 @@
     "enableLocalLog": true,
     "sendLogsToSheet": false,
     "ignoreCompletedLateness": true,
-    "completedMarkers": ["✅", "☑️", "✔️", "✔"],
-    "incompleteMarkers": ["❌", "✘", "✖"],
-    "latenessSubsectionMarkers": ["CUSTOM", "READY STOK", "READY STOCK"],
+    "completedMarkers": [
+      "?",
+      "??",
+      "??",
+      "?"
+    ],
+    "incompleteMarkers": [
+      "?",
+      "?",
+      "?"
+    ],
+    "latenessSubsectionMarkers": [
+      "CUSTOM",
+      "READY STOK",
+      "READY STOCK"
+    ],
     "localLogFile": "./logs/parser-log.jsonl",
     "stateFile": "./logs/bot-state.json",
     "dedupWindowMs": 86400000,
@@ -36,6 +49,18 @@
       "sendToKnownGroups": true,
       "recentGroupWindowMs": 604800000,
       "targetGroupJids": []
+    },
+    "latenessSummary": {
+      "enabled": true,
+      "times": [
+        "06:00",
+        "16:30"
+      ],
+      "useReportGroup": true,
+      "targetGroupJids": [],
+      "storeLimit": 20,
+      "snapshotWindowMs": 259200000,
+      "sendWhenEmpty": false
     },
     "latenessReport": {
       "sendStructuredToSheet": true,
@@ -58,10 +83,35 @@
       "banding": 8
     },
     "divisionTriggers": {
-      "SMB": ["job masuk", "dm", "cs"],
-      "Creative": ["desain", "acc pertama", "acc per"],
-      "Printing": ["printing", "print", "prt", "pr"],
-      "Finishing": ["checker", "cheker", "potong", "ptng", "packing", "pack", "pkg", "fn", "cp", "ck", "pt"]
+      "SMB": [
+        "job masuk",
+        "dm",
+        "cs"
+      ],
+      "Creative": [
+        "desain",
+        "acc pertama",
+        "acc per"
+      ],
+      "Printing": [
+        "printing",
+        "print",
+        "prt",
+        "pr"
+      ],
+      "Finishing": [
+        "checker",
+        "cheker",
+        "potong",
+        "ptng",
+        "packing",
+        "pack",
+        "pkg",
+        "fn",
+        "cp",
+        "ck",
+        "pt"
+      ]
     },
     "shippingAnchors": [
       "hemat kargo",
