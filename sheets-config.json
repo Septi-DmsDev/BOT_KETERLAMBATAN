@@ -22,15 +22,15 @@
     "sendLogsToSheet": false,
     "ignoreCompletedLateness": true,
     "completedMarkers": [
-      "?",
-      "??",
-      "??",
-      "?"
+      "✅",
+      "☑️",
+      "✔️",
+      "✔"
     ],
     "incompleteMarkers": [
-      "?",
-      "?",
-      "?"
+      "❌",
+      "✘",
+      "✖"
     ],
     "latenessSubsectionMarkers": [
       "CUSTOM",
