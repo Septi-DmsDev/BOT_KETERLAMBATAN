@@ -101,10 +101,23 @@ function getTimeKey(timeZone = BOT_TIMEZONE, date = new Date()) {
   return `${parts.get('hour')}:${parts.get('minute')}`;
 }
 
-function getMonthlySheetName(timeZone = BOT_TIMEZONE, date = new Date()) {
+function getMonthlySheetName(timeZone = BOT_TIMEZONE, date = new Date(), rules = {}) {
   const parts = getNowParts(timeZone, date);
-  const monthIndex = Number(parts.get('month')) - 1;
-  return `${MONTH_NAMES_ID[monthIndex] || 'Sheet'} ${parts.get('year')}`;
+  const periodStartDay = Math.min(31, Math.max(1, Number(rules.sheetPeriodStartDay || 26)));
+  let month = Number(parts.get('month'));
+  let year = Number(parts.get('year'));
+  const day = Number(parts.get('day'));
+
+  if (day >= periodStartDay) {
+    month += 1;
+    if (month > 12) {
+      month = 1;
+      year += 1;
+    }
+  }
+
+  const monthIndex = month - 1;
+  return `${MONTH_NAMES_ID[monthIndex] || 'Sheet'} ${year}`;
 }
 
 function getSummaryConfig(rules = {}) {
@@ -141,10 +154,10 @@ function getDedupWindowMs(rules = {}) {
 
 function getCurrentSheetName(rules = {}, date = new Date()) {
   if (String(rules.sheetMode || '').toLowerCase() === 'monthly') {
-    return getMonthlySheetName(rules.timeZone || BOT_TIMEZONE, date);
+    return getMonthlySheetName(rules.timeZone || BOT_TIMEZONE, date, rules);
   }
 
-  return rules.sheetName || getMonthlySheetName(rules.timeZone || BOT_TIMEZONE, date);
+  return rules.sheetName || getMonthlySheetName(rules.timeZone || BOT_TIMEZONE, date, rules);
 }
 
 function parseTimeValue(value = '16:30') {

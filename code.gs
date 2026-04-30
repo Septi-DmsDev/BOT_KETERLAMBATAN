@@ -1,4 +1,19 @@
 const AUTH_TOKEN = 'ganti-token-rahasia-kamu';
+const MONTH_NAMES_ID = ['Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni', 'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember'];
+const MONTH_NUMBER_BY_NAME = Object.freeze({
+  januari: 1,
+  februari: 2,
+  maret: 3,
+  april: 4,
+  mei: 5,
+  juni: 6,
+  juli: 7,
+  agustus: 8,
+  september: 9,
+  oktober: 10,
+  november: 11,
+  desember: 12
+});
 
 function doPost(e) {
   let lock;
@@ -72,19 +87,111 @@ function getOrCreateMainSheet(ss, sheetName, body) {
     return sheet;
   }
 
+  const compatibleSheet = findCompatibleMainSheet(ss, sheetName);
+  if (compatibleSheet) {
+    return compatibleSheet;
+  }
+
+  const preferredSheetName = getPreferredMainSheetName(sheetName);
+  const preferredSheet = ss.getSheetByName(preferredSheetName);
+  if (preferredSheet) {
+    return preferredSheet;
+  }
+
   if (!body.autoCreateSheet) {
-    throw new Error('Sheet tidak ditemukan: ' + sheetName);
+    throw new Error('Sheet tidak ditemukan: ' + preferredSheetName);
   }
 
   if (body.sheetTemplateName) {
     const templateSheet = ss.getSheetByName(body.sheetTemplateName);
     if (templateSheet) {
-      sheet = templateSheet.copyTo(ss).setName(sheetName);
+      sheet = templateSheet.copyTo(ss).setName(preferredSheetName);
       return sheet;
     }
   }
 
-  return ss.insertSheet(sheetName);
+  return ss.insertSheet(preferredSheetName);
+}
+
+function findCompatibleMainSheet(ss, requestedSheetName) {
+  const requestedInfo = extractMonthYearFromSheetName(requestedSheetName);
+  if (!requestedInfo) return null;
+
+  let best = null;
+
+  ss.getSheets().forEach(function(candidateSheet) {
+    const candidateName = candidateSheet.getName();
+    const candidateInfo = extractMonthYearFromSheetName(candidateName);
+    if (!candidateInfo) return;
+    if (candidateInfo.year !== requestedInfo.year || candidateInfo.month !== requestedInfo.month) return;
+
+    let score = 10;
+    if (candidateInfo.hasMonthPrefix) score += 5;
+    if (/keterlambatan/i.test(candidateName)) score += 2;
+
+    if (!best || score > best.score) {
+      best = { score, sheet: candidateSheet };
+    }
+  });
+
+  return best ? best.sheet : null;
+}
+
+function getPreferredMainSheetName(rawName) {
+  const parsed = extractMonthYearFromSheetName(rawName);
+  if (!parsed) return String(rawName || '').trim() || 'Sheet 1';
+
+  const monthLabel = MONTH_NAMES_ID[parsed.month - 1] || 'Sheet';
+  return pad2(parsed.month) + '. ' + monthLabel + ' ' + parsed.year;
+}
+
+function extractMonthYearFromSheetName(name) {
+  const source = String(name || '').trim();
+  if (!source) return null;
+
+  const normalized = normalizeSheetNameText(source);
+  const yearMatch = normalized.match(/\b(20\d{2})\b/);
+  if (!yearMatch) return null;
+
+  const monthPrefixMatch = source.match(/^\s*(\d{1,2})\s*[.)-]/);
+  const monthFromPrefix = monthPrefixMatch ? Number(monthPrefixMatch[1]) : null;
+  const monthFromName = getMonthFromText(normalized);
+
+  let month = monthFromName;
+  if (!month && monthFromPrefix && monthFromPrefix >= 1 && monthFromPrefix <= 12) {
+    month = monthFromPrefix;
+  }
+
+  if (!month) return null;
+
+  return {
+    month: month,
+    year: Number(yearMatch[1]),
+    hasMonthPrefix: Boolean(monthFromPrefix && monthFromPrefix >= 1 && monthFromPrefix <= 12)
+  };
+}
+
+function getMonthFromText(normalizedText) {
+  const monthNames = Object.keys(MONTH_NUMBER_BY_NAME);
+  for (var i = 0; i < monthNames.length; i += 1) {
+    var monthName = monthNames[i];
+    var pattern = new RegExp('\\b' + monthName + '\\b', 'i');
+    if (pattern.test(normalizedText)) {
+      return MONTH_NUMBER_BY_NAME[monthName];
+    }
+  }
+  return null;
+}
+
+function normalizeSheetNameText(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+function pad2(value) {
+  return String(value).padStart(2, '0');
 }
 
 function handleAppendLog(body) {
