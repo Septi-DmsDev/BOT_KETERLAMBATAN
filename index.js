@@ -104,6 +104,7 @@ function getTimeKey(timeZone = BOT_TIMEZONE, date = new Date()) {
 function getMonthlySheetName(timeZone = BOT_TIMEZONE, date = new Date(), rules = {}) {
   const parts = getNowParts(timeZone, date);
   const periodStartDay = Math.min(31, Math.max(1, Number(rules.sheetPeriodStartDay || 26)));
+  const monthlySheetNameFormat = String(rules.monthlySheetNameFormat || 'numbered').toLowerCase();
   let month = Number(parts.get('month'));
   let year = Number(parts.get('year'));
   const day = Number(parts.get('day'));
@@ -117,7 +118,12 @@ function getMonthlySheetName(timeZone = BOT_TIMEZONE, date = new Date(), rules =
   }
 
   const monthIndex = month - 1;
-  return `${MONTH_NAMES_ID[monthIndex] || 'Sheet'} ${year}`;
+  const monthLabel = MONTH_NAMES_ID[monthIndex] || 'Sheet';
+  if (monthlySheetNameFormat === 'plain') {
+    return `${monthLabel} ${year}`;
+  }
+
+  return `${String(month).padStart(2, '0')}. ${monthLabel} ${year}`;
 }
 
 function getSummaryConfig(rules = {}) {

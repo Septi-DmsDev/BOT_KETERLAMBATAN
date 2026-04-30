@@ -75,6 +75,8 @@ function handleAppendData(body) {
   return jsonResponse({
     success: true,
     message: 'Data berhasil ditambahkan',
+    sheet: sheet.getName(),
+    requestedSheetName: body.sheetName,
     row: nextRow,
     type: body.type,
     data: rowData
@@ -121,12 +123,14 @@ function findCompatibleMainSheet(ss, requestedSheetName) {
 
   ss.getSheets().forEach(function(candidateSheet) {
     const candidateName = candidateSheet.getName();
-    const candidateInfo = extractMonthYearFromSheetName(candidateName);
+    const candidateInfo = extractMonthYearFromSheetName(candidateName, requestedInfo.year);
     if (!candidateInfo) return;
-    if (candidateInfo.year !== requestedInfo.year || candidateInfo.month !== requestedInfo.month) return;
+    if (candidateInfo.month !== requestedInfo.month) return;
+    if (requestedInfo.year && candidateInfo.year && candidateInfo.year !== requestedInfo.year) return;
 
     let score = 10;
     if (candidateInfo.hasMonthPrefix) score += 5;
+    if (candidateInfo.hasYear) score += 3;
     if (/keterlambatan/i.test(candidateName)) score += 2;
 
     if (!best || score > best.score) {
@@ -145,13 +149,14 @@ function getPreferredMainSheetName(rawName) {
   return pad2(parsed.month) + '. ' + monthLabel + ' ' + parsed.year;
 }
 
-function extractMonthYearFromSheetName(name) {
+function extractMonthYearFromSheetName(name, fallbackYear) {
   const source = String(name || '').trim();
   if (!source) return null;
 
   const normalized = normalizeSheetNameText(source);
   const yearMatch = normalized.match(/\b(20\d{2})\b/);
-  if (!yearMatch) return null;
+  const year = yearMatch ? Number(yearMatch[1]) : Number(fallbackYear || 0);
+  if (!year) return null;
 
   const monthPrefixMatch = source.match(/^\s*(\d{1,2})\s*[.)-]/);
   const monthFromPrefix = monthPrefixMatch ? Number(monthPrefixMatch[1]) : null;
@@ -166,7 +171,8 @@ function extractMonthYearFromSheetName(name) {
 
   return {
     month: month,
-    year: Number(yearMatch[1]),
+    year: year,
+    hasYear: Boolean(yearMatch),
     hasMonthPrefix: Boolean(monthFromPrefix && monthFromPrefix >= 1 && monthFromPrefix <= 12)
   };
 }
