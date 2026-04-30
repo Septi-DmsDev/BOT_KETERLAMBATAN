@@ -953,9 +953,22 @@ function isHeaderLine(text = '') {
 }
 
 
+function maybeDecodeMojibake(text = '') {
+  let current = String(text || '');
+
+  for (let index = 0; index < 2; index += 1) {
+    if (!/[\u00c2\u00c3\u00e2\u00f0\u00ef]/.test(current)) break;
+
+    const decoded = Buffer.from(current, 'latin1').toString('utf8');
+    if (!decoded || decoded === current) break;
+    current = decoded;
+  }
+
+  return current;
+}
+
 function normalizeReportSpaces(text = '') {
-  return String(text || '')
-    .replace(/âœ…|â˜‘ï¸|âœ”ï¸|âœ”|âŒ|âœ˜|âœ–|ðŸ“Š|ðŸ“‹|ðŸ†”|ðŸ•’|ðŸ“Œ|ðŸ—‚ï¸|ðŸ”|ðŸ”•|ðŸ“|âš ï¸/g, match => MOJIBAKE_SYMBOL_MAP[match] || match)
+  return maybeDecodeMojibake(String(text || ''))
     .replace(/[\u0000-\u001f]+/g, ' ')
     .replace(/[\u200B-\u200D\uFEFF]/g, ' ')
     .replace(/\u00A0/g, ' ')
@@ -972,6 +985,16 @@ function normalizeMarkerList(markers = []) {
 
 function cleanReportLine(text = '') {
   return normalizeReportSpaces(String(text || '').replace(/^\uFEFF/, '').trim());
+}
+
+function isIgnorableReportLine(text = '') {
+  const cleaned = cleanReportLine(text);
+  if (!cleaned) return true;
+
+  const unwrapped = cleaned.replace(/^\*+|\*+$/g, '').trim();
+  if (!unwrapped) return true;
+
+  return /^note\b/i.test(unwrapped);
 }
 
 function normalizeStoreName(raw = '') {
@@ -1049,9 +1072,8 @@ function classifyLatenessEntryType(content = '') {
   const cleaned = cleanReportLine(content);
   if (!cleaned) return 'unknown';
 
-  const firstToken = cleaned.split(' ')[0] || '';
-  if (/^[A-Z]{2,3}$/i.test(firstToken)) return 'custom';
-  if (isReadyStockCode(firstToken)) return 'ready_stock';
+  if (isCustomCodeStart(cleaned)) return 'custom';
+  if (normalizeReadyStockCandidate(cleaned)) return 'ready_stock';
   return 'unknown';
 }
 
@@ -1098,14 +1120,26 @@ function createLatenessStoreBucket(header) {
   };
 }
 
+function resolveLatenessMarkers(candidateMarkers = [], fallbackMarkers = []) {
+  const normalizedCandidates = normalizeMarkerList(candidateMarkers);
+  const hasMeaningfulMarker = normalizedCandidates.some(marker => /[^\?\s]/.test(marker));
+  if (hasMeaningfulMarker) {
+    return normalizedCandidates;
+  }
+
+  return normalizeMarkerList(fallbackMarkers);
+}
+
 function getLatenessReportOptions(rules = {}) {
   return {
-    completedMarkers: Array.isArray(rules.completedMarkers) && rules.completedMarkers.length
-      ? normalizeMarkerList(rules.completedMarkers)
-      : normalizeMarkerList(DEFAULT_LATENESS_REPORT_OPTIONS.completedMarkers),
-    incompleteMarkers: Array.isArray(rules.incompleteMarkers) && rules.incompleteMarkers.length
-      ? normalizeMarkerList(rules.incompleteMarkers)
-      : normalizeMarkerList(DEFAULT_LATENESS_REPORT_OPTIONS.incompleteMarkers),
+    completedMarkers: resolveLatenessMarkers(
+      Array.isArray(rules.completedMarkers) ? rules.completedMarkers : [],
+      ['✅', '☑️', '✔️', '✔']
+    ),
+    incompleteMarkers: resolveLatenessMarkers(
+      Array.isArray(rules.incompleteMarkers) ? rules.incompleteMarkers : [],
+      ['❌', '✘', '✖']
+    ),
     subsectionMarkers: Array.isArray(rules.latenessSubsectionMarkers) && rules.latenessSubsectionMarkers.length
       ? rules.latenessSubsectionMarkers.map(item => normalizeReportSpaces(item).toUpperCase())
       : DEFAULT_LATENESS_REPORT_OPTIONS.subsectionMarkers
@@ -1147,6 +1181,7 @@ function parseLatenessReport(text = '', rules = {}) {
     const rawLine = lines[index];
     const cleaned = cleanReportLine(rawLine);
     if (!cleaned) continue;
+    if (isIgnorableReportLine(cleaned)) continue;
 
     const storeHeader = parseStoreHeaderLine(cleaned);
     if (storeHeader) {
