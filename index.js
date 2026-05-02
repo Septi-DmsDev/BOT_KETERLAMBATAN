@@ -143,29 +143,53 @@ function hasExcessiveDisconnects(rules = {}) {
   return disconnectEvents.length >= maxDisconnects;
 }
 
-function validateAuthState(rules = {}) {
+function inspectAuthState(rules = {}) {
   const authDir = getAuthDirPath(rules);
   const credsPath = path.join(authDir, 'creds.json');
+  const authDirExists = fs.existsSync(authDir);
+  const credsExists = fs.existsSync(credsPath);
 
-  if (!fs.existsSync(authDir)) {
-    throw new Error(`Auth directory tidak ditemukan: ${authDir}`);
+  if (!authDirExists) {
+    return {
+      authDir,
+      credsPath,
+      authDirExists: false,
+      credsExists: false,
+      requiresPairing: true
+    };
   }
 
-  if (!fs.existsSync(credsPath)) {
-    throw new Error(`creds.json tidak ditemukan: ${credsPath}`);
+  if (!credsExists) {
+    return {
+      authDir,
+      credsPath,
+      authDirExists: true,
+      credsExists: false,
+      requiresPairing: true
+    };
   }
 
   const stats = fs.statSync(credsPath);
   if (!stats.size) {
     throw new Error(`creds.json kosong: ${credsPath}`);
   }
+
+  return {
+    authDir,
+    credsPath,
+    authDirExists: true,
+    credsExists: true,
+    credsSize: stats.size,
+    requiresPairing: false
+  };
 }
 
 function initializeRuntimeStorage(rules = {}) {
   ensureDirForFile(getStateFilePath(rules));
   ensureDirForFile(getLocalLogFilePath(rules));
   ensureDirForFile(getHealthFilePath(rules));
-  validateAuthState(rules);
+  fs.mkdirSync(getAuthDirPath(rules), { recursive: true });
+  return inspectAuthState(rules);
 }
 
 function getTimestamp(date = new Date(), timeZone = BOT_TIMEZONE) {
@@ -2529,13 +2553,17 @@ function startBackgroundWorkers(rules) {
 async function connectToWhatsApp() {
   startWatchdog();
   const rules = appConfig.operasional;
-  initializeRuntimeStorage(rules);
+  const authState = initializeRuntimeStorage(rules);
   writeHealthStatus(rules, {
     phase: 'booting',
     pid: process.pid,
     reconnectAttempt,
-    authDir: getAuthDirPath(rules)
+    authDir: getAuthDirPath(rules),
+    authState
   });
+  if (authState?.requiresPairing) {
+    console.log('Auth belum tersedia penuh. Bot akan masuk mode scan QR / pairing ulang.');
+  }
   startBackgroundWorkers(rules);
 
   const {
