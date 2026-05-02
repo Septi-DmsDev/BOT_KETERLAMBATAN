@@ -44,6 +44,9 @@ let retryQueueTimer = null;
 let retryQueueInProgress = false;
 let runtimeStateCache = null;
 let activeSock = null;
+let reconnectTimer = null;
+let reconnectAttempt = 0;
+let disconnectEvents = [];
 
 function startWatchdog() {
   clearTimeout(watchdogTimer);
@@ -56,6 +59,113 @@ function startWatchdog() {
 function stopWatchdog() {
   clearTimeout(watchdogTimer);
   console.log('🛡️ [WATCHDOG] Aman.');
+}
+
+function clearReconnectTimer() {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+}
+
+function getDisconnectStatusCode(lastDisconnect) {
+  const error = lastDisconnect?.error;
+  return error?.output?.statusCode || error?.data?.statusCode || error?.statusCode || 0;
+}
+
+function getDisconnectMessage(lastDisconnect) {
+  const error = lastDisconnect?.error;
+  if (!error) return 'Unknown disconnect error';
+  return String(error?.message || error?.data?.message || error);
+}
+
+function getDisconnectStack(lastDisconnect) {
+  const error = lastDisconnect?.error;
+  return String(error?.stack || '').trim();
+}
+
+function scheduleReconnect(reason = '') {
+  if (reconnectTimer) return;
+
+  reconnectAttempt += 1;
+  const delayMs = Math.min(30000, Math.max(2000, reconnectAttempt * 5000));
+  console.log(`ðŸ” Menjadwalkan reconnect ${delayMs}ms. Attempt=${reconnectAttempt}${reason ? ` | ${reason}` : ''}`);
+
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectToWhatsApp().catch(error => {
+      console.error('âŒ connectToWhatsApp gagal saat reconnect:', error?.stack || error?.message || error);
+      scheduleReconnect('connectToWhatsApp throw');
+    });
+  }, delayMs);
+}
+
+function readJsonIfExists(filePath) {
+  try {
+    if (!fs.existsSync(filePath)) return null;
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function writeHealthStatus(rules = {}, patch = {}) {
+  try {
+    const healthPath = getHealthFilePath(rules);
+    const current = readJsonIfExists(healthPath) || {};
+    const next = {
+      ...current,
+      ...patch,
+      updatedAt: new Date().toISOString()
+    };
+    ensureDirForFile(healthPath);
+    fs.writeFileSync(healthPath, JSON.stringify(next, null, 2), 'utf8');
+  } catch (error) {
+    console.error('Gagal menulis health file:', error.message);
+  }
+}
+
+function recordDisconnectEvent(statusCode = 0, message = '') {
+  const now = Date.now();
+  disconnectEvents.push({
+    at: now,
+    statusCode,
+    message: String(message || '').slice(0, 300)
+  });
+
+  const windowMs = 10 * 60 * 1000;
+  disconnectEvents = disconnectEvents.filter(item => now - item.at <= windowMs);
+  return disconnectEvents.length;
+}
+
+function hasExcessiveDisconnects(rules = {}) {
+  const maxDisconnects = Math.max(5, Number(rules.maxDisconnectsBeforeRestart || 8));
+  return disconnectEvents.length >= maxDisconnects;
+}
+
+function validateAuthState(rules = {}) {
+  const authDir = getAuthDirPath(rules);
+  const credsPath = path.join(authDir, 'creds.json');
+
+  if (!fs.existsSync(authDir)) {
+    throw new Error(`Auth directory tidak ditemukan: ${authDir}`);
+  }
+
+  if (!fs.existsSync(credsPath)) {
+    throw new Error(`creds.json tidak ditemukan: ${credsPath}`);
+  }
+
+  const stats = fs.statSync(credsPath);
+  if (!stats.size) {
+    throw new Error(`creds.json kosong: ${credsPath}`);
+  }
+}
+
+function initializeRuntimeStorage(rules = {}) {
+  ensureDirForFile(getStateFilePath(rules));
+  ensureDirForFile(getLocalLogFilePath(rules));
+  ensureDirForFile(getHealthFilePath(rules));
+  validateAuthState(rules);
 }
 
 function getTimestamp(date = new Date(), timeZone = BOT_TIMEZONE) {
@@ -140,6 +250,18 @@ function getNotificationConfig(rules = {}) {
 
 function getStateFilePath(rules = {}) {
   return rules.stateFile || './logs/bot-state.json';
+}
+
+function getLocalLogFilePath(rules = {}) {
+  return rules.localLogFile || './logs/parser-log.jsonl';
+}
+
+function getHealthFilePath(rules = {}) {
+  return rules.healthFile || './logs/session-health.json';
+}
+
+function getAuthDirPath(rules = {}) {
+  return rules.authDir || 'auth_info_baileys';
 }
 
 function getRetryDelayMs(rules = {}) {
@@ -858,7 +980,7 @@ function createLogRecord(status, reason, context, parsed = {}, extra = {}) {
 
 async function writeAndSendLog(record, rules) {
   if (rules.enableLocalLog) {
-    writeLocalLog(rules.localLogFile, record);
+    writeLocalLog(getLocalLogFilePath(rules), record);
   }
 
   await sendLogToWebhook(record, rules);
@@ -2407,6 +2529,13 @@ function startBackgroundWorkers(rules) {
 async function connectToWhatsApp() {
   startWatchdog();
   const rules = appConfig.operasional;
+  initializeRuntimeStorage(rules);
+  writeHealthStatus(rules, {
+    phase: 'booting',
+    pid: process.pid,
+    reconnectAttempt,
+    authDir: getAuthDirPath(rules)
+  });
   startBackgroundWorkers(rules);
 
   const {
@@ -2416,7 +2545,8 @@ async function connectToWhatsApp() {
     fetchLatestBaileysVersion
   } = await import('@whiskeysockets/baileys');
 
-  const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
+  const authDir = getAuthDirPath(rules);
+  const { state, saveCreds } = await useMultiFileAuthState(authDir);
   const { version, isLatest } = await fetchLatestBaileysVersion();
 
   console.log(`🔄 Menggunakan WA v${version.join('.')}, isLatest: ${isLatest}`);
@@ -2439,6 +2569,10 @@ async function connectToWhatsApp() {
     if (qr) {
       console.log('📲 QR Code muncul, silakan scan.');
       qrcode.generate(qr, { small: true });
+      writeHealthStatus(rules, {
+        phase: 'waiting_qr',
+        reconnectAttempt
+      });
       stopWatchdog();
     }
 
@@ -2447,26 +2581,85 @@ async function connectToWhatsApp() {
         activeSock = null;
       }
 
-      const shouldReconnect =
-        (lastDisconnect?.error instanceof Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
+      const statusCode = getDisconnectStatusCode(lastDisconnect);
+      const disconnectMessage = getDisconnectMessage(lastDisconnect);
+      const disconnectStack = getDisconnectStack(lastDisconnect);
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+      const disconnectCount = recordDisconnectEvent(statusCode, disconnectMessage);
 
       console.log('⚠️ Koneksi terputus. Reconnect:', shouldReconnect);
 
+      console.log('ðŸ“ Disconnect detail:', {
+        statusCode,
+        message: disconnectMessage,
+        disconnectCount
+      });
+      if (disconnectStack) {
+        console.log('ðŸ“ Disconnect stack:', disconnectStack.split('\n').slice(0, 8).join('\n'));
+      }
+
+      writeHealthStatus(rules, {
+        phase: 'closed',
+        reconnectAttempt,
+        disconnectCount,
+        lastDisconnect: {
+          statusCode,
+          message: disconnectMessage
+        }
+      });
+
       if (shouldReconnect) {
+        if (hasExcessiveDisconnects(rules)) {
+          console.error('Disconnect loop melewati batas aman. Biarkan container restart bersih.');
+          writeHealthStatus(rules, {
+            phase: 'disconnect_loop_guard',
+            reconnectAttempt,
+            disconnectCount,
+            lastDisconnect: {
+              statusCode,
+              message: disconnectMessage
+            }
+          });
+          process.exit(1);
+        }
+
         startWatchdog();
-        connectToWhatsApp();
+        scheduleReconnect(`statusCode=${statusCode}`);
       } else {
         console.log('❌ Sesi logout. Hapus folder auth_info_baileys lalu scan ulang.');
+        writeHealthStatus(rules, {
+          phase: 'logged_out',
+          reconnectAttempt,
+          disconnectCount,
+          lastDisconnect: {
+            statusCode,
+            message: disconnectMessage
+          }
+        });
         process.exit(1);
       }
     } else if (connection === 'open') {
       activeSock = sock;
+      reconnectAttempt = 0;
+      disconnectEvents = [];
+      clearReconnectTimer();
+      writeHealthStatus(rules, {
+        phase: 'open',
+        reconnectAttempt: 0,
+        connectedAt: new Date().toISOString(),
+        lastDisconnect: null
+      });
       stopWatchdog();
       console.log('✅ Bot operasional siap menerima pesan.');
     }
   });
 
-  sock.ev.on('creds.update', saveCreds);
+  sock.ev.on('creds.update', () => {
+    saveCreds();
+    writeHealthStatus(rules, {
+      lastCredsUpdateAt: new Date().toISOString()
+    });
+  });
 
   sock.ev.on('messages.upsert', async event => {
     if (event.type !== 'notify') return;

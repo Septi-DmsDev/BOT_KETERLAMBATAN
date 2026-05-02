@@ -22,16 +22,19 @@
     "enableLocalLog": true,
     "sendLogsToSheet": false,
     "ignoreCompletedLateness": true,
+    "authDir": "./auth_info_baileys",
+    "healthFile": "./logs/session-health.json",
+    "maxDisconnectsBeforeRestart": 8,
     "completedMarkers": [
-      "✅",
-      "☑️",
-      "✔️",
-      "✔"
+      "\u2705",
+      "\u2611\uFE0F",
+      "\u2714\uFE0F",
+      "\u2714"
     ],
     "incompleteMarkers": [
-      "❌",
-      "✘",
-      "✖"
+      "\u274C",
+      "\u2718",
+      "\u2716"
     ],
     "latenessSubsectionMarkers": [
       "CUSTOM",
