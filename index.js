@@ -12,6 +12,9 @@ const MONTH_NAMES_ID = ['Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni', 
 const groupNameCache = new Map();
 const messageCache = new Map();
 const SUMMARY_DIVISIONS = ['SMB', 'Creative', 'Printing', 'Finishing'];
+const REACTION_SUCCESS = '\u2705';
+const REACTION_WARNING = '\u26A0\uFE0F';
+const REACTION_ERROR = '\u274C';
 const DEFAULT_COMPLETED_RESOLUTION_PHRASES = [
   'sudah selesai',
   'sudah selesai dan terkirim',
@@ -1083,8 +1086,16 @@ async function writeAndSendLog(record, rules) {
   await sendLogToWebhook(record, rules);
 }
 
+function getProcessingReactionEmoji({ actionableCount = 0, successCount = 0 } = {}) {
+  if (actionableCount <= 0) return '';
+  if (successCount === actionableCount) return REACTION_SUCCESS;
+  if (successCount > 0) return REACTION_WARNING;
+  return REACTION_ERROR;
+}
+
 async function processOperasionalLines(sock, rules, lines = [], context = {}) {
   const dayKey = getDateKey(rules.timeZone || BOT_TIMEZONE);
+  let actionableCount = 0;
   let successCount = 0;
   const parseErrorsForSender = [];
   const reportParseErrors = [];
@@ -1105,6 +1116,7 @@ async function processOperasionalLines(sock, rules, lines = [], context = {}) {
 
     const parsed = parseLine(line, rules);
     if (!parsed) continue;
+    actionableCount += 1;
 
     if (parsed.error) {
       incrementStat(rules, dayKey, 'parseErrorCount');
@@ -1231,8 +1243,9 @@ async function processOperasionalLines(sock, rules, lines = [], context = {}) {
     }
   }
 
-  if (successCount > 0 && sock && context.groupJid && context.messageKey) {
-    await safeReact(sock, context.groupJid, context.messageKey, 'âœ…');
+  const reactionEmoji = getProcessingReactionEmoji({ actionableCount, successCount });
+  if (reactionEmoji && sock && context.groupJid && context.messageKey) {
+    await safeReact(sock, context.groupJid, context.messageKey, reactionEmoji);
   }
 
   await sendParseErrorsToPrivate(sock, rules, context.senderPrivateJid, parseErrorsForSender);
@@ -1243,6 +1256,7 @@ async function processOperasionalLines(sock, rules, lines = [], context = {}) {
   }, reportParseErrors, reportWebhookErrors);
 
   return {
+    actionableCount,
     successCount,
     parseErrorsForSender,
     reportParseErrors,
