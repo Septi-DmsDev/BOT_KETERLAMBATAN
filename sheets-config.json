@@ -18,6 +18,9 @@
       "apo printing",
       "apo finishing"
     ],
+    "allowedGroupJids": [
+      "120363044609306347@g.us"
+    ],
     "replyOnError": true,
     "enableLocalLog": true,
     "sendLogsToSheet": false,
@@ -67,7 +70,7 @@
       "sendWhenEmpty": false
     },
     "latenessReport": {
-      "sendStructuredToSheet": true,
+      "sendStructuredToSheet": false,
       "summarySheetName": "BOT_LATENESS_SUMMARY",
       "itemSheetName": "BOT_LATENESS_ITEMS"
     },
@@ -104,6 +107,7 @@
         "pr"
       ],
       "Finishing": [
+        "finishing",
         "checker",
         "cheker",
         "potong",

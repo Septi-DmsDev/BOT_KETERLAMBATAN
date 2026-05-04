@@ -12,6 +12,14 @@ const MONTH_NAMES_ID = ['Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni', 
 const groupNameCache = new Map();
 const messageCache = new Map();
 const SUMMARY_DIVISIONS = ['SMB', 'Creative', 'Printing', 'Finishing'];
+const DEFAULT_COMPLETED_RESOLUTION_PHRASES = [
+  'sudah selesai',
+  'sudah selesai dan terkirim',
+  'selesai dan terkirim',
+  'sudah terkirim',
+  'job sudah selesai',
+  'terkirim'
+];
 const DEFAULT_LATENESS_REPORT_OPTIONS = {
   completedMarkers: ['✅', '☑️', '✔️', '✔'],
   incompleteMarkers: ['❌', '✘', '✖'],
@@ -286,6 +294,71 @@ function getHealthFilePath(rules = {}) {
 
 function getAuthDirPath(rules = {}) {
   return rules.authDir || 'auth_info_baileys';
+}
+
+function getAllowedGroupJids(rules = {}) {
+  if (!Array.isArray(rules.allowedGroupJids)) return [];
+  return rules.allowedGroupJids
+    .map(item => String(item || '').trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function isAllowedGroup(rules = {}, groupJid = '', groupName = '') {
+  const allowedGroupJids = getAllowedGroupJids(rules);
+  const normalizedJid = String(groupJid || '').trim().toLowerCase();
+
+  if (allowedGroupJids.length > 0) {
+    return allowedGroupJids.includes(normalizedJid);
+  }
+
+  return (rules.groupKeywords || []).some(keyword =>
+    String(groupName || '').toLowerCase().includes(String(keyword).toLowerCase())
+  );
+}
+
+function hasPlaceholderToken(value = '', patterns = []) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (!normalized) return true;
+  return patterns.some(pattern => normalized.includes(pattern));
+}
+
+function inspectOperationalConfig(rules = {}) {
+  const issues = [];
+  const notificationConfig = getNotificationConfig(rules);
+  const webhook = String(rules.webhook || '').trim();
+  const token = String(rules.token || '').trim();
+  const spreadsheetId = String(rules.spreadsheetId || '').trim();
+  const reportGroupJid = String(notificationConfig.reportGroupJid || '').trim();
+
+  const webhookLooksReady =
+    /^https:\/\/script\.google\.com\/macros\/s\/.+\/exec$/i.test(webhook) &&
+    !hasPlaceholderToken(webhook, ['yoursheetidwebhook', 'example', 'ganti']);
+
+  const tokenLooksReady = !hasPlaceholderToken(token, ['ganti-token', 'your', 'contoh', 'example']);
+  const spreadsheetIdLooksReady = !hasPlaceholderToken(spreadsheetId, ['yoursheetid', 'spreadsheetid', 'contoh', 'example']);
+
+  if (!webhookLooksReady) issues.push('webhook belum valid');
+  if (!tokenLooksReady) issues.push('token belum valid');
+  if (!spreadsheetIdLooksReady) issues.push('spreadsheetId belum valid');
+  if (notificationConfig.sendErrorLogToReportGroup && !reportGroupJid) {
+    issues.push('reportGroupJid kosong');
+  }
+  if (
+    notificationConfig.operationalGroupMode === 'silent' &&
+    notificationConfig.sendErrorLogToReportGroup &&
+    !reportGroupJid
+  ) {
+    issues.push('mode silent tanpa report group');
+  }
+
+  return {
+    webhookLooksReady,
+    tokenLooksReady,
+    spreadsheetIdLooksReady,
+    reportGroupJidReady: Boolean(reportGroupJid),
+    issues,
+    isReadyForSheetWrite: webhookLooksReady && tokenLooksReady && spreadsheetIdLooksReady
+  };
 }
 
 function getRetryDelayMs(rules = {}) {
@@ -1010,6 +1083,173 @@ async function writeAndSendLog(record, rules) {
   await sendLogToWebhook(record, rules);
 }
 
+async function processOperasionalLines(sock, rules, lines = [], context = {}) {
+  const dayKey = getDateKey(rules.timeZone || BOT_TIMEZONE);
+  let successCount = 0;
+  const parseErrorsForSender = [];
+  const reportParseErrors = [];
+  const reportWebhookErrors = [];
+
+  for (const line of lines) {
+    const cleanedLine = normalizeSpaces(cleanLinePrefix(line));
+    const lineContext = {
+      groupName: context.groupName || '',
+      sender: context.sender || '',
+      messageId: context.messageId || '',
+      line,
+      cleanedLine
+    };
+
+    if (!cleanedLine) continue;
+    if (isHeaderLine(cleanedLine)) continue;
+
+    const parsed = parseLine(line, rules);
+    if (!parsed) continue;
+
+    if (parsed.error) {
+      incrementStat(rules, dayKey, 'parseErrorCount');
+
+      const errorRecord = createLogRecord(
+        'PARSE_ERROR',
+        parsed.error,
+        lineContext,
+        parsed,
+        { cleanedLine }
+      );
+
+      await writeAndSendLog(errorRecord, rules);
+
+      const parseErrorItem = {
+        line: cleanedLine,
+        reason: parsed.error
+      };
+
+      parseErrorsForSender.push(parseErrorItem);
+      reportParseErrors.push(parseErrorItem);
+      continue;
+    }
+
+    const dedupKey = buildDedupKey(parsed, context.groupJid || '');
+    if (isDuplicatePayload(rules, dedupKey)) {
+      incrementStat(rules, dayKey, 'duplicateCount');
+
+      const duplicateRecord = createLogRecord(
+        'DUPLICATE_SKIPPED',
+        'Duplicate ditolak.',
+        lineContext,
+        parsed,
+        {
+          cleanedLine: parsed.raw_text,
+          dedupKey
+        }
+      );
+
+      await writeAndSendLog(duplicateRecord, rules);
+      continue;
+    }
+
+    const webhookPayload = buildWebhookPayload(parsed, rules);
+    markDedupEntry(rules, dedupKey, 'pending', {
+      messageId: context.messageId || '',
+      sheetName: webhookPayload.sheetName
+    });
+
+    try {
+      await sendDataToWebhook(webhookPayload, rules);
+      incrementDivisionSuccess(rules, dayKey, parsed.pj_divisi);
+      markDedupEntry(rules, dedupKey, 'success', {
+        messageId: context.messageId || '',
+        sheetName: webhookPayload.sheetName
+      });
+
+      const successRecord = createLogRecord(
+        'SUCCESS',
+        'OK',
+        lineContext,
+        parsed,
+        {
+          cleanedLine: parsed.raw_text,
+          dedupKey,
+          sheetName: webhookPayload.sheetName
+        }
+      );
+
+      await writeAndSendLog(successRecord, rules);
+      successCount += 1;
+    } catch (error) {
+      const safeReason = getSafeWebhookReason(error);
+      const retryable = shouldRetryWebhook(error);
+      const reasonForUser = retryable ? `${safeReason} (masuk antrean retry)` : safeReason;
+
+      incrementStat(rules, dayKey, 'webhookErrorCount');
+
+      const webhookErrorRecord = createLogRecord(
+        'WEBHOOK_ERROR',
+        reasonForUser,
+        lineContext,
+        parsed,
+        {
+          cleanedLine: parsed.raw_text,
+          dedupKey,
+          raw_error: String(error.stack || error.message || '').slice(0, 4000),
+          sheetName: webhookPayload.sheetName
+        }
+      );
+
+      await writeAndSendLog(webhookErrorRecord, rules);
+
+      if (retryable) {
+        const retryItem = {
+          id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          dedupKey,
+          dayKey,
+          payload: webhookPayload,
+          parsed,
+          context: {
+            ...lineContext,
+            cleanedLine: parsed.raw_text
+          },
+          attemptCount: 1,
+          nextAttemptAt: Date.now() + getRetryDelayMs(rules),
+          createdAt: new Date().toISOString(),
+          lastError: safeReason
+        };
+
+        enqueueRetryItem(rules, retryItem);
+        markDedupEntry(rules, dedupKey, 'pending', {
+          itemId: retryItem.id,
+          sheetName: webhookPayload.sheetName
+        });
+      } else {
+        clearDedupEntry(rules, dedupKey);
+      }
+
+      reportWebhookErrors.push({
+        line: cleanedLine,
+        reason: reasonForUser
+      });
+    }
+  }
+
+  if (successCount > 0 && sock && context.groupJid && context.messageKey) {
+    await safeReact(sock, context.groupJid, context.messageKey, 'âœ…');
+  }
+
+  await sendParseErrorsToPrivate(sock, rules, context.senderPrivateJid, parseErrorsForSender);
+  await sendReportGroupLog(sock, rules, {
+    groupName: context.groupName || '',
+    sender: context.sender || '',
+    messageId: context.messageId || ''
+  }, reportParseErrors, reportWebhookErrors);
+
+  return {
+    successCount,
+    parseErrorsForSender,
+    reportParseErrors,
+    reportWebhookErrors
+  };
+}
+
 function normalizeSpaces(text = '') {
   return String(text)
     .replace(/[*_~`]/g, '')
@@ -1671,6 +1911,7 @@ function buildTriggerRegex(trigger) {
   if (t === 'acc per') return /(^|[\s/,-])acc\s*per(?=$|[\s/,-])/i;
 
   if (t === 'packing' || t === 'pack') return /(^|[\s/,-])pack(?:ing)?(?=$|[\s/,-]|\d)/i;
+  if (t === 'finishing') return /(^|[\s/,-])finishing(?=$|[\s/,-]|\d)/i;
   if (t === 'checker') return /(^|[\s/,-])checker(?=$|[\s/,-]|\d)/i;
   if (t === 'cheker') return /(^|[\s/,-])cheker(?=$|[\s/,-]|\d)/i;
   if (t === 'potong') return /(^|[\s/,-])potong(?=$|[\s/,-]|\d)/i;
@@ -1757,6 +1998,16 @@ function detectSetorPPDivision(rawText = '') {
     trigger: isFinishing ? 'setor pp < 12.31' : 'setor pp >= 12.31',
     sourceText: source
   };
+}
+
+function hasCompletedResolutionPhrase(text = '') {
+  const source = normalizeSpaces(String(text || '').toLowerCase());
+  if (!source) return false;
+
+  return DEFAULT_COMPLETED_RESOLUTION_PHRASES.some(phrase => {
+    const pattern = new RegExp(`\\b${escapeRegex(phrase).replace(/\s+/g, '\\s+')}\\b`, 'i');
+    return pattern.test(source);
+  });
 }
 
 function buildAnchorRegex(anchor) {
@@ -2213,6 +2464,8 @@ function isCompletedHandledLine(line, rules = {}) {
   const cleaned = normalizeSpaces(cleanLinePrefix(source));
   if (!looksLikeOperasionalLine(cleaned)) return false;
 
+  if (hasCompletedResolutionPhrase(cleaned)) return true;
+
   return Boolean(detectDivision(cleaned, rules.divisionTriggers));
 }
 
@@ -2554,15 +2807,20 @@ async function connectToWhatsApp() {
   startWatchdog();
   const rules = appConfig.operasional;
   const authState = initializeRuntimeStorage(rules);
+  const configHealth = inspectOperationalConfig(rules);
   writeHealthStatus(rules, {
     phase: 'booting',
     pid: process.pid,
     reconnectAttempt,
     authDir: getAuthDirPath(rules),
-    authState
+    authState,
+    configHealth
   });
   if (authState?.requiresPairing) {
     console.log('Auth belum tersedia penuh. Bot akan masuk mode scan QR / pairing ulang.');
+  }
+  if (configHealth.issues.length) {
+    console.warn(`Konfigurasi operasional perlu dicek: ${configHealth.issues.join(', ')}`);
   }
   startBackgroundWorkers(rules);
 
@@ -2675,7 +2933,8 @@ async function connectToWhatsApp() {
         phase: 'open',
         reconnectAttempt: 0,
         connectedAt: new Date().toISOString(),
-        lastDisconnect: null
+        lastDisconnect: null,
+        configHealth: inspectOperationalConfig(rules)
       });
       stopWatchdog();
       console.log('✅ Bot operasional siap menerima pesan.');
@@ -2734,9 +2993,7 @@ async function connectToWhatsApp() {
       }
     }
 
-    const allowed = (rules.groupKeywords || []).some(keyword =>
-      groupName.includes(String(keyword).toLowerCase())
-    );
+    const allowed = isAllowedGroup(rules, from, groupName);
 
     if (!allowed) return;
     rememberKnownGroup(rules, from, groupName);
@@ -2751,12 +3008,17 @@ async function connectToWhatsApp() {
     if (trimmed === '!status') {
       const reportGroupStatus = notificationConfig.reportGroupJid ? 'set' : 'belum diset';
       const latenessTimes = normalizeScheduleTimes(getLatenessSummaryConfig(rules).times, ['06:00', '16:30']).join(', ');
+      const allowedGroupJids = getAllowedGroupJids(rules);
+      const groupFilterMode = allowedGroupJids.length > 0
+        ? `JID locked (${allowedGroupJids.length})`
+        : 'keyword';
       return reply(
         `? Bot aktif.
 ?? Server: ${getTimestamp()}
 ?? Mode: Operasional Parser
 ??? Sheet: ${getCurrentSheetName(rules)}
 ?? Retry Queue: ${getRetryQueueLength(rules)}
+?? Filter grup: ${groupFilterMode}
 ?? Grup operasional: ${notificationConfig.operationalGroupMode || 'reply'}
 ?? Report group: ${reportGroupStatus}
 ?? Rekap keterlambatan: ${latenessTimes} WIB`
@@ -2809,6 +3071,19 @@ async function connectToWhatsApp() {
       } catch (error) {
         console.error('Gagal kirim lateness report ke sheet:', error.message);
       }
+      await processOperasionalLines(
+        sock,
+        rules,
+        parsedReport.stores.flatMap(store => store.items.map(item => item.raw || item.content).filter(Boolean)),
+        {
+          groupJid: from,
+          groupName,
+          sender: latenessContext.sender,
+          senderPrivateJid: getSenderPrivateJid(msg),
+          messageId: latenessContext.messageId,
+          messageKey: msg.key
+        }
+      );
       return;
     }
 
@@ -2816,6 +3091,29 @@ async function connectToWhatsApp() {
     const senderPrivateJid = getSenderPrivateJid(msg);
     const messageId = msg.key?.id || '';
     const lines = text.split('\n').map(x => x.trim()).filter(Boolean);
+
+    const {
+      reportParseErrors: nextReportParseErrors,
+      reportWebhookErrors: nextReportWebhookErrors
+    } = await processOperasionalLines(sock, rules, lines, {
+      groupJid: from,
+      groupName,
+      sender,
+      senderPrivateJid,
+      messageId,
+      messageKey: msg.key
+    });
+
+    const nextShouldReplyInOperationalGroup =
+      notificationConfig.operationalGroupMode !== 'silent' &&
+      rules.replyOnError &&
+      (nextReportParseErrors.length > 0 || nextReportWebhookErrors.length > 0);
+
+    if (nextShouldReplyInOperationalGroup) {
+      await reply(buildFailedLinesReply([...nextReportParseErrors, ...nextReportWebhookErrors]));
+    }
+    return;
+
     const dayKey = getDateKey(rules.timeZone || BOT_TIMEZONE);
 
     let successCount = 0;
