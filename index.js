@@ -3,6 +3,7 @@ const pino = require('pino');
 const qrcode = require('qrcode-terminal');
 const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
 const fs = require('fs');
+const http = require('http');
 const path = require('path');
 
 const appConfig = JSON.parse(fs.readFileSync('./sheets-config.json', 'utf8'));
@@ -58,13 +59,32 @@ let activeSock = null;
 let reconnectTimer = null;
 let reconnectAttempt = 0;
 let disconnectEvents = [];
+let livenessTimer = null;
+let activeGeneration = 0;
+let activeConnectionState = 'close';
+let isProbeRunning = false;
+let consecutiveProbeFailures = 0;
+let lastSuccessfulProbeAt = 0;
+let lastConnectionOpenAt = 0;
+let lastDisconnectReason = 'boot';
+let isShuttingDown = false;
+
+const HEALTH_PORT = Number(process.env.HEALTH_PORT || process.env.PORT || 3000);
+const BOOT_WATCHDOG_MS = Number(process.env.WA_BOOT_WATCHDOG_MS || 180000);
+const LIVENESS_INTERVAL_MS = Number(process.env.WA_LIVENESS_INTERVAL_MS || 120000);
+const LIVENESS_TIMEOUT_MS = Number(process.env.WA_LIVENESS_TIMEOUT_MS || 15000);
+const LIVENESS_MAX_FAILURES = Number(process.env.WA_LIVENESS_MAX_FAILURES || 4);
+const LIVENESS_RECOVERY_GRACE_MS = Number(process.env.WA_LIVENESS_RECOVERY_GRACE_MS || 180000);
+const HEALTH_MAX_STALENESS_MS = Number(
+  process.env.WA_HEALTH_MAX_STALENESS_MS || (LIVENESS_INTERVAL_MS + LIVENESS_TIMEOUT_MS + 30000)
+);
 
 function startWatchdog() {
   clearTimeout(watchdogTimer);
   watchdogTimer = setTimeout(() => {
     console.error('🚨 [WATCHDOG FATAL] Bot gagal konek/hang terlalu lama. Restart paksa...');
     process.exit(1);
-  }, 180000);
+  }, BOOT_WATCHDOG_MS);
 }
 
 function stopWatchdog() {
@@ -77,6 +97,82 @@ function clearReconnectTimer() {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
   }
+}
+
+function clearLivenessProbe() {
+  if (livenessTimer) {
+    clearInterval(livenessTimer);
+    livenessTimer = null;
+  }
+  isProbeRunning = false;
+}
+
+function destroySocket(sock) {
+  if (!sock) return;
+  try {
+    sock.ev.removeAllListeners();
+  } catch {}
+  try {
+    sock.ws?.close?.();
+  } catch {}
+  try {
+    sock.end?.();
+  } catch {}
+}
+
+function normalizeJid(jid = '') {
+  return String(jid || '').replace(/:\d+@/, '@');
+}
+
+function getHealthSnapshot(endpoint = '/healthz') {
+  const now = Date.now();
+  const lastProbeReference = lastSuccessfulProbeAt || lastConnectionOpenAt || 0;
+  const probeAgeMs = lastProbeReference ? now - lastProbeReference : null;
+  const ready =
+    !isShuttingDown &&
+    activeConnectionState === 'open' &&
+    probeAgeMs !== null &&
+    probeAgeMs <= HEALTH_MAX_STALENESS_MS &&
+    consecutiveProbeFailures < LIVENESS_MAX_FAILURES;
+  const alive =
+    !isShuttingDown &&
+    (
+      ready ||
+      activeConnectionState === 'connecting' ||
+      activeConnectionState === 'waiting_qr' ||
+      activeConnectionState === 'reconnecting'
+    );
+  const ok = endpoint === '/readyz' ? ready : alive;
+
+  return {
+    ok,
+    alive,
+    ready,
+    connection: activeConnectionState,
+    lastProbeAt: lastSuccessfulProbeAt || null,
+    lastConnectionOpenAt: lastConnectionOpenAt || null,
+    probeAgeMs,
+    consecutiveProbeFailures,
+    lastDisconnectReason
+  };
+}
+
+function startHealthServer() {
+  const server = http.createServer((req, res) => {
+    if (req.url !== '/healthz' && req.url !== '/readyz') {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'not_found' }));
+      return;
+    }
+
+    const snapshot = getHealthSnapshot(req.url);
+    res.writeHead(snapshot.ok ? 200 : 503, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(snapshot));
+  });
+
+  server.listen(HEALTH_PORT, '0.0.0.0', () => {
+    console.log(`[HEALTH] Endpoint aktif di :${HEALTH_PORT}/healthz`);
+  });
 }
 
 function getDisconnectStatusCode(lastDisconnect) {
@@ -96,7 +192,7 @@ function getDisconnectStack(lastDisconnect) {
 }
 
 function scheduleReconnect(reason = '') {
-  if (reconnectTimer) return;
+  if (isShuttingDown || reconnectTimer) return;
 
   reconnectAttempt += 1;
   const delayMs = Math.min(30000, Math.max(2000, reconnectAttempt * 5000));
@@ -109,6 +205,81 @@ function scheduleReconnect(reason = '') {
       scheduleReconnect('connectToWhatsApp throw');
     });
   }, delayMs);
+}
+
+async function runLivenessProbe(sock, generation) {
+  if (
+    isShuttingDown ||
+    generation !== activeGeneration ||
+    activeConnectionState !== 'open' ||
+    isProbeRunning
+  ) {
+    return;
+  }
+
+  const botJid = normalizeJid(sock?.user?.id);
+  if (!botJid) {
+    console.error('[LIVENESS] sock.user.id tidak tersedia. Restart paksa.');
+    process.exit(1);
+    return;
+  }
+
+  isProbeRunning = true;
+  let timeoutHandle = null;
+
+  try {
+    await Promise.race([
+      sock.fetchStatus(botJid),
+      new Promise((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+          reject(new Error(`fetchStatus timeout ${LIVENESS_TIMEOUT_MS} ms`));
+        }, LIVENESS_TIMEOUT_MS);
+      })
+    ]);
+
+    consecutiveProbeFailures = 0;
+    lastSuccessfulProbeAt = Date.now();
+  } catch (error) {
+    consecutiveProbeFailures += 1;
+    console.error(`[LIVENESS] FAIL ${consecutiveProbeFailures}/${LIVENESS_MAX_FAILURES}: ${error.message}`);
+
+    if (consecutiveProbeFailures >= LIVENESS_MAX_FAILURES) {
+      const referenceAt = lastSuccessfulProbeAt || lastConnectionOpenAt || 0;
+      const withinRecoveryGrace =
+        referenceAt > 0 &&
+        (Date.now() - referenceAt) < LIVENESS_RECOVERY_GRACE_MS;
+
+      if (withinRecoveryGrace) {
+        console.warn(
+          `[LIVENESS] Batas gagal tercapai tetapi masih dalam recovery grace ${LIVENESS_RECOVERY_GRACE_MS}ms. Belum exit.`
+        );
+      } else {
+        console.error('[LIVENESS] Batas gagal terlampaui. Restart paksa untuk auto-heal.');
+        process.exit(1);
+      }
+    }
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+    isProbeRunning = false;
+  }
+}
+
+function startLivenessProbe(sock, generation) {
+  clearLivenessProbe();
+  consecutiveProbeFailures = 0;
+  lastSuccessfulProbeAt = Date.now();
+
+  livenessTimer = setInterval(() => {
+    runLivenessProbe(sock, generation).catch(error => {
+      console.error('[LIVENESS] Unexpected probe error:', error?.stack || error?.message || error);
+      process.exit(1);
+    });
+  }, LIVENESS_INTERVAL_MS);
+
+  runLivenessProbe(sock, generation).catch(error => {
+    console.error('[LIVENESS] Initial probe error:', error?.stack || error?.message || error);
+    process.exit(1);
+  });
 }
 
 function readJsonIfExists(filePath) {
@@ -2818,7 +2989,13 @@ function startBackgroundWorkers(rules) {
 }
 
 async function connectToWhatsApp() {
+  if (isShuttingDown) return;
+
   startWatchdog();
+  clearLivenessProbe();
+  destroySocket(activeSock);
+  activeSock = null;
+  activeConnectionState = 'connecting';
   const rules = appConfig.operasional;
   const authState = initializeRuntimeStorage(rules);
   const configHealth = inspectOperationalConfig(rules);
@@ -2848,6 +3025,7 @@ async function connectToWhatsApp() {
   const authDir = getAuthDirPath(rules);
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
   const { version, isLatest } = await fetchLatestBaileysVersion();
+  const generation = ++activeGeneration;
 
   console.log(`🔄 Menggunakan WA v${version.join('.')}, isLatest: ${isLatest}`);
 
@@ -2862,13 +3040,16 @@ async function connectToWhatsApp() {
     connectTimeoutMs: 60000,
     getMessage: async key => messageCache.get(key.id) || undefined
   });
+  activeSock = sock;
 
   sock.ev.on('connection.update', update => {
+    if (generation !== activeGeneration) return;
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
       console.log('📲 QR Code muncul, silakan scan.');
       qrcode.generate(qr, { small: true });
+      activeConnectionState = 'waiting_qr';
       writeHealthStatus(rules, {
         phase: 'waiting_qr',
         reconnectAttempt
@@ -2880,11 +3061,15 @@ async function connectToWhatsApp() {
       if (activeSock === sock) {
         activeSock = null;
       }
+      activeConnectionState = 'close';
+      clearLivenessProbe();
 
       const statusCode = getDisconnectStatusCode(lastDisconnect);
       const disconnectMessage = getDisconnectMessage(lastDisconnect);
       const disconnectStack = getDisconnectStack(lastDisconnect);
+      lastDisconnectReason = String(statusCode || disconnectMessage || 'unknown_close');
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+      activeConnectionState = shouldReconnect ? 'reconnecting' : 'logged_out';
       const disconnectCount = recordDisconnectEvent(statusCode, disconnectMessage);
 
       console.log('⚠️ Koneksi terputus. Reconnect:', shouldReconnect);
@@ -2940,6 +3125,9 @@ async function connectToWhatsApp() {
       }
     } else if (connection === 'open') {
       activeSock = sock;
+      activeConnectionState = 'open';
+      lastConnectionOpenAt = Date.now();
+      lastSuccessfulProbeAt = Date.now();
       reconnectAttempt = 0;
       disconnectEvents = [];
       clearReconnectTimer();
@@ -2951,11 +3139,13 @@ async function connectToWhatsApp() {
         configHealth: inspectOperationalConfig(rules)
       });
       stopWatchdog();
+      startLivenessProbe(sock, generation);
       console.log('✅ Bot operasional siap menerima pesan.');
     }
   });
 
   sock.ev.on('creds.update', () => {
+    if (generation !== activeGeneration) return;
     saveCreds();
     writeHealthStatus(rules, {
       lastCredsUpdateAt: new Date().toISOString()
@@ -2963,6 +3153,7 @@ async function connectToWhatsApp() {
   });
 
   sock.ev.on('messages.upsert', async event => {
+    if (generation !== activeGeneration) return;
     if (event.type !== 'notify') return;
 
     const msg = event.messages[0];
@@ -3127,182 +3318,39 @@ async function connectToWhatsApp() {
       await reply(buildFailedLinesReply([...nextReportParseErrors, ...nextReportWebhookErrors]));
     }
     return;
-
-    const dayKey = getDateKey(rules.timeZone || BOT_TIMEZONE);
-
-    let successCount = 0;
-    const parseErrorsForSender = [];
-    const reportParseErrors = [];
-    const reportWebhookErrors = [];
-
-    for (const line of lines) {
-      const cleanedLine = normalizeSpaces(cleanLinePrefix(line));
-      const lineContext = {
-        groupName,
-        sender,
-        messageId,
-        line,
-        cleanedLine
-      };
-
-      if (!cleanedLine) continue;
-      if (isHeaderLine(cleanedLine)) continue;
-
-      const parsed = parseLine(line, rules);
-      if (!parsed) continue;
-
-      if (parsed.error) {
-        incrementStat(rules, dayKey, 'parseErrorCount');
-
-        const errorRecord = createLogRecord(
-          'PARSE_ERROR',
-          parsed.error,
-          lineContext,
-          parsed,
-          { cleanedLine }
-        );
-
-        await writeAndSendLog(errorRecord, rules);
-
-        const parseErrorItem = {
-          line: cleanedLine,
-          reason: parsed.error
-        };
-
-        parseErrorsForSender.push(parseErrorItem);
-        reportParseErrors.push(parseErrorItem);
-
-        continue;
-      }
-
-      const dedupKey = buildDedupKey(parsed, from);
-      if (isDuplicatePayload(rules, dedupKey)) {
-        incrementStat(rules, dayKey, 'duplicateCount');
-
-        const duplicateRecord = createLogRecord(
-          'DUPLICATE_SKIPPED',
-          'Duplicate ditolak.',
-          lineContext,
-          parsed,
-          {
-            cleanedLine: parsed.raw_text,
-            dedupKey
-          }
-        );
-
-        await writeAndSendLog(duplicateRecord, rules);
-        continue;
-      }
-
-      const webhookPayload = buildWebhookPayload(parsed, rules);
-      markDedupEntry(rules, dedupKey, 'pending', {
-        messageId,
-        sheetName: webhookPayload.sheetName
-      });
-
-      try {
-        await sendDataToWebhook(webhookPayload, rules);
-        incrementDivisionSuccess(rules, dayKey, parsed.pj_divisi);
-        markDedupEntry(rules, dedupKey, 'success', {
-          messageId,
-          sheetName: webhookPayload.sheetName
-        });
-
-        const successRecord = createLogRecord(
-          'SUCCESS',
-          'OK',
-          lineContext,
-          parsed,
-          {
-            cleanedLine: parsed.raw_text,
-            dedupKey,
-            sheetName: webhookPayload.sheetName
-          }
-        );
-
-        await writeAndSendLog(successRecord, rules);
-        successCount += 1;
-      } catch (error) {
-        const safeReason = getSafeWebhookReason(error);
-        const retryable = shouldRetryWebhook(error);
-        const reasonForUser = retryable ? `${safeReason} (masuk antrean retry)` : safeReason;
-
-        incrementStat(rules, dayKey, 'webhookErrorCount');
-
-        const webhookErrorRecord = createLogRecord(
-          'WEBHOOK_ERROR',
-          reasonForUser,
-          lineContext,
-          parsed,
-          {
-            cleanedLine: parsed.raw_text,
-            dedupKey,
-            raw_error: String(error.stack || error.message || '').slice(0, 4000),
-            sheetName: webhookPayload.sheetName
-          }
-        );
-
-        await writeAndSendLog(webhookErrorRecord, rules);
-
-        if (retryable) {
-          const retryItem = {
-            id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-            dedupKey,
-            dayKey,
-            payload: webhookPayload,
-            parsed,
-            context: {
-              ...lineContext,
-              cleanedLine: parsed.raw_text
-            },
-            attemptCount: 1,
-            nextAttemptAt: Date.now() + getRetryDelayMs(rules),
-            createdAt: new Date().toISOString(),
-            lastError: safeReason
-          };
-
-          enqueueRetryItem(rules, retryItem);
-          markDedupEntry(rules, dedupKey, 'pending', {
-            itemId: retryItem.id,
-            sheetName: webhookPayload.sheetName
-          });
-        } else {
-          clearDedupEntry(rules, dedupKey);
-        }
-
-        reportWebhookErrors.push({
-          line: cleanedLine,
-          reason: reasonForUser
-        });
-      }
-    }
-
-    if (successCount > 0) {
-      await safeReact(sock, from, msg.key, '✅');
-    }
-
-    const notificationContext = {
-      groupName,
-      sender,
-      messageId
-    };
-
-    await sendParseErrorsToPrivate(sock, rules, senderPrivateJid, parseErrorsForSender);
-    await sendReportGroupLog(sock, rules, notificationContext, reportParseErrors, reportWebhookErrors);
-
-    const shouldReplyInOperationalGroup =
-      notificationConfig.operationalGroupMode !== 'silent' &&
-      rules.replyOnError &&
-      (reportParseErrors.length > 0 || reportWebhookErrors.length > 0);
-
-    if (shouldReplyInOperationalGroup) {
-      await reply(buildFailedLinesReply([...reportParseErrors, ...reportWebhookErrors]));
-    }
   });
 }
 
+function shutdown(signal = 'unknown') {
+  if (isShuttingDown) return;
+
+  isShuttingDown = true;
+  console.log(`[SHUTDOWN] Signal ${signal} diterima. Menutup bot.`);
+  clearReconnectTimer();
+  clearLivenessProbe();
+  clearTimeout(watchdogTimer);
+  destroySocket(activeSock);
+  activeSock = null;
+  setTimeout(() => process.exit(0), 250);
+}
+
 if (require.main === module) {
-  connectToWhatsApp();
+  startHealthServer();
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('uncaughtException', error => {
+    console.error('[FATAL] uncaughtException:', error?.stack || error?.message || error);
+    process.exit(1);
+  });
+  process.on('unhandledRejection', reason => {
+    const message = reason instanceof Error ? (reason.stack || reason.message) : String(reason);
+    console.error('[FATAL] unhandledRejection:', message);
+    process.exit(1);
+  });
+  connectToWhatsApp().catch(error => {
+    console.error('[BOOT] Gagal start socket:', error?.stack || error?.message || error);
+    process.exit(1);
+  });
 }
 
 module.exports = {
